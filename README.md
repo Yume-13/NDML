@@ -29,7 +29,7 @@ in the game folder under `ndml/`.
 
 ## Download
 
-Prebuilt releases: [itch.io](https://catmancer0.itch.io/ndml) or
+Prebuilt releases: [itch.io](https://catmancer0.itch.io/ndml-nova-drift-mod-loader) or
 [GitHub Releases](https://github.com/Yume-13/NDML/releases). Each download contains the
 full source code (`ndml-source.zip`).
 

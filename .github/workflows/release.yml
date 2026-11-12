@@ -47,7 +47,7 @@ permissions:
   contents: write
 
 env:
-  ITCH_TARGET: ${{ vars.ITCH_TARGET || 'catmancer0/ndml' }}
+  ITCH_TARGET: ${{ vars.ITCH_TARGET || 'catmancer0/ndml-nova-drift-mod-loader' }}
   ITCH_CHANNEL: windows
 
 jobs:
