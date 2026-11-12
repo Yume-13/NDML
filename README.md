@@ -12,7 +12,7 @@ game updates as long as the functions they use still exist.
   edit their settings, read the log and launch the game.
 * **SDK** (`ndml-sdk`): the Rust crate mods are written with.
 
-NDML works offline. Nothing is downloaded or uploaded, and all files it writes stay
+NDML never requires nor asks for internet access. Nothing is downloaded or uploaded, and all files it writes stay
 in the game folder under `ndml/`.
 
 > **Mods are native code.** A mod runs inside the game process with the same access
@@ -23,7 +23,7 @@ in the game folder under `ndml/`.
 
 | Mod | What it does |
 |---|---|
-| `magnet-range` | Multiplies the distance from which XP orbs and power-ups are pulled toward the ship (default 3x). |
+| `magnet-range` | Multiplies the distance from which XP orbs and power-ups are pulled toward the ship. |
 | `discord-presence` | Shows the current run (wave, level, score, run time, boss or hull) as Discord rich presence. Talks only to the local Discord app. |
 | `probe` | Developer tool: logs calls to chosen GML functions and selected instance variables. Off by default. |
 
