@@ -25,7 +25,8 @@
 # * Push a tag `v*` (e.g. `v0.1.0`): build, create a GitHub release with the zip,
 #   then upload the same files to itch.io with butler.
 # * Run manually ("Run workflow"): build and keep the zip as a workflow artifact;
-#   uploads to itch.io only if `itch` is checked.
+#   uploads to itch.io only if `itch` is checked. `version` labels the build
+#   (e.g. to upload an existing release again); default: dev-<commit>.
 #
 # Configuration (repository settings → Secrets and variables → Actions):
 # * secret `BUTLER_API_KEY`: itch.io API key (https://itch.io/user/settings/api-keys)
@@ -42,6 +43,10 @@ on:
         description: "Also upload to itch.io"
         type: boolean
         default: false
+      version:
+        description: "Version label (empty = dev-<commit>)"
+        type: string
+        default: ""
 
 permissions:
   contents: write
@@ -74,8 +79,12 @@ jobs:
       - name: Package
         id: package
         shell: pwsh
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          $version = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { "dev-$($env:GITHUB_SHA.Substring(0, 7))" }
+          $version = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME }
+                     elseif ($env:INPUT_VERSION) { $env:INPUT_VERSION }
+                     else { "dev-$($env:GITHUB_SHA.Substring(0, 7))" }
           $dir = "dist/ndml"
           New-Item -ItemType Directory -Force $dir | Out-Null
           Copy-Item target/release/ndml.exe, target/release/ndml_loader.dll $dir
@@ -107,7 +116,7 @@ jobs:
           BUTLER_API_KEY: ${{ secrets.BUTLER_API_KEY }}
         run: |
           if (-not $env:BUTLER_API_KEY) { throw "secret BUTLER_API_KEY is not set" }
-          Invoke-WebRequest https://broth.itch.ovh/butler/windows-amd64/LATEST/archive/default -OutFile butler.zip
+          Invoke-WebRequest https://broth.itch.zone/butler/windows-amd64/LATEST/archive/default -OutFile butler.zip
           Expand-Archive butler.zip -DestinationPath butler
           ./butler/butler.exe -V
           ./butler/butler.exe push dist/ndml "$($env:ITCH_TARGET):$($env:ITCH_CHANNEL)" --userversion "${{ steps.package.outputs.version }}"
