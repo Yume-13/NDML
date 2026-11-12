@@ -1,5 +1,7 @@
 # NDML: Nova Drift Mod Loader
 
+![The NDML manager](https://raw.githubusercontent.com/Yume-13/NDML/media/ndmlmenu.gif)
+
 NDML loads native mods into [Nova Drift](https://store.steampowered.com/app/858210/Nova_Drift/).
 It hooks the game's compiled GameMaker functions by name, so mods keep working across
 game updates as long as the functions they use still exist.
