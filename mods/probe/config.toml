@@ -1,0 +1,11 @@
+# Probe: developer tool. Logs the first calls of the GML functions in `watch`
+# with the instance variables below. Leave `watch` empty to keep it inert.
+#
+# Example: watch = ["gml_Object_oMenu_Step_0", "gml_Script_powerupAttract"]
+watch = []
+
+# Instance variables to print (built-ins such as x/y are not read).
+variables = ["magDist"]
+
+# Calls logged per watched function before going quiet.
+max_calls = 3

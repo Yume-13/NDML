@@ -1,0 +1,20 @@
+[package]
+name = "probe"
+description = "Dev tool: logs the first calls of chosen GML functions with instance variables"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lib]
+name = "ndmod_probe"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ndml-sdk.workspace = true
+log.workspace = true
+serde.workspace = true
+
+[lints]
+workspace = true

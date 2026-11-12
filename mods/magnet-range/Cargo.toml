@@ -1,0 +1,21 @@
+[package]
+name = "magnet-range"
+description = "Scales the pickup (magnetism) range of XP orbs and power-ups"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lib]
+# Mod DLLs are named ndmod_<name>.dll; the manager deploys every such DLL.
+name = "ndmod_magnet_range"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ndml-sdk.workspace = true
+log.workspace = true
+serde.workspace = true
+
+[lints]
+workspace = true

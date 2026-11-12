@@ -1,0 +1,71 @@
+# Discord Presence: shows the current Nova Drift run as Discord rich presence.
+#
+# Requires the Discord desktop app running on the same PC. Nothing is sent
+# anywhere else; the mod talks to Discord's local pipe only.
+enabled = true
+
+# Discord application the presence is shown under. The default is Nova Drift's
+# own Discord app (the one Discord's game detection shows as "Playing Nova
+# Drift"), from Discord's public detectable-applications list
+# (GET https://discord.com/api/v9/applications/detectable, entry "Nova Drift",
+# executable nova drift/novadrift.exe).
+# A custom app (e.g. for custom art) can be created at
+# https://discord.com/developers/applications; put its Application ID here.
+# Empty or invalid = the mod stays idle and says so in the log.
+client_id = "1124352634573312211"
+
+# Which values to show. A switched-off value drops the template segment that
+# uses it (see templates below).
+show_level = true
+show_wave = true
+show_score = true
+show_time = true
+show_boss = true
+# The chosen hull ("Engineer"), shown when no boss is being fought.
+show_hull = true
+
+# false = no pause indicator: a paused run looks exactly like live play (same
+# text, elapsed counter keeps running; the run clock then includes pauses).
+# true = "Paused" templates below, and the counter hides while paused.
+show_paused = false
+
+# Discord's own "mm:ss elapsed" counter for the run (stops while paused).
+show_elapsed = true
+# Show "In the menus" when no run is going; false clears the presence there.
+show_in_menu = true
+
+# Templates. Placeholders: {level} {wave} {score} {time} {boss} {hull}.
+# "|" separates optional segments: a segment whose value is unavailable
+# (no boss right now, value switched off) is dropped; the rest are joined
+# with " · ". Inside a segment, "~" separates alternatives; the first one
+# with all its values is shown ("vs {boss} ~ {hull}" = the boss during
+# a boss fight, otherwise the hull). Discord shows "details" on the first
+# line and "state" below.
+run_details = "Wave {wave} | Level {level}"
+run_state = "vs {boss} ~ {hull} | Score {score}"
+# Used only with show_paused = true.
+paused_details = "Paused | Wave {wave} | Level {level}"
+paused_state = "vs {boss} ~ {hull} | Score {score}"
+game_over_details = "Run over | Wave {wave} | Level {level}"
+game_over_state = "Final score {score}"
+menu_details = "In the menus"
+menu_state = ""
+
+# Art asset key of the Discord application ("" = no picture), and its hover
+# text. Nova Drift's Discord app has no usable rich-presence art, so this only
+# applies with a custom client_id and an uploaded asset.
+large_image = ""
+large_text = "Nova Drift"
+
+# Digit grouping for {score}: "," -> 1,234,567. "" = none.
+thousands_separator = ","
+
+# Seconds between routine updates (score, wave, timer). Discord accepts about
+# 5 updates per 20 s; boss fights and phase changes (run start, game over)
+# skip this wait and go out at once while that budget allows, so keeping
+# this at 5 or more leaves room for them. Clamped to [5, 300].
+update_interval_secs = 5
+
+# Keep showing "vs <boss>" this many seconds after the boss dies, so a fight
+# that's over in seconds still shows up in the presence. 0 = off; max 120.
+boss_linger_secs = 10

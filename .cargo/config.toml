@@ -1,0 +1,7 @@
+# Statically link the MSVC CRT so the DLLs don't depend on vcruntime140.dll.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[alias]
+# `cargo ndml install` — build-then-deploy helper, see crates/ndml-cli.
+ndml = "run -q -p ndml-cli --"

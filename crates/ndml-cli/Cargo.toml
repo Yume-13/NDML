@@ -1,0 +1,21 @@
+[package]
+name = "ndml-cli"
+description = "NDML manager: retro terminal UI (and scriptable CLI) to deploy and configure mods"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ndml"
+path = "src/main.rs"
+
+[dependencies]
+ndml-common.workspace = true
+ndml-sdk.workspace = true
+ratatui = "0.30"
+toml_edit = "0.25"
+
+[lints]
+workspace = true

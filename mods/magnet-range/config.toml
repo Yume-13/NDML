@@ -1,0 +1,7 @@
+# Magnet Range: pickup (magnetism) distance for XP orbs and power-ups.
+#
+# Multiplier on the game's attraction field (range and the matching pull, like
+# extra Magnetism). 1.0 = vanilla, 3.0 = orbs are pulled toward the ship from
+# three times the distance. Clamped to (0, 50]; 0 or invalid disables the mod.
+# Stacks multiplicatively with the in-game Magnetism upgrade.
+range_multiplier = 3.0
