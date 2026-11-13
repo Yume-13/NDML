@@ -48,13 +48,13 @@ pub mod presence;
 pub mod worker;
 
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use ndml_sdk::{Call, Error, ModContext, Variable};
 use serde::Deserialize;
 
 use game::{BOSSES, Controller, Globals, Tracker};
-use presence::{ElapsedClock, Templates, Toggles};
+use presence::{Templates, Toggles};
 use worker::{Desired, Update, Worker};
 
 pub const CONTROLLER_STEP: &str = "gml_Object_oController_Step_0";
@@ -101,10 +101,11 @@ pub struct Config {
     pub show_boss: bool,
     pub show_hull: bool,
     pub show_paused: bool,
-    pub show_elapsed: bool,
     pub show_in_menu: bool,
     pub run_details: String,
     pub run_state: String,
+    pub run_state_alt: String,
+    pub rotate_secs: u64,
     pub paused_details: String,
     pub paused_state: String,
     pub game_over_details: String,
@@ -151,6 +152,7 @@ impl Config {
         Templates {
             run_details: self.run_details.clone(),
             run_state: self.run_state.clone(),
+            run_state_alt: self.run_state_alt.clone(),
             paused_details: self.paused_details.clone(),
             paused_state: self.paused_state.clone(),
             game_over_details: self.game_over_details.clone(),
@@ -158,7 +160,6 @@ impl Config {
             menu_details: self.menu_details.clone(),
             menu_state: self.menu_state.clone(),
             show_in_menu: self.show_in_menu,
-            show_elapsed: self.show_elapsed,
             large_image: self.large_image.clone(),
             large_text: self.large_text.clone(),
             thousands_separator: self.thousands_separator.clone(),
@@ -170,7 +171,8 @@ impl Config {
 #[derive(Debug)]
 struct State {
     tracker: Tracker,
-    clock: ElapsedClock,
+    started: Instant,
+    rotate: Option<Duration>,
     last_tick: Option<Instant>,
     last_sent: Option<Desired>,
     /// Phase and boss of the last published update (changes are urgent).
@@ -191,12 +193,6 @@ fn with_state(state: &Shared, f: impl FnOnce(&mut State)) {
     f(&mut state.lock().unwrap_or_else(PoisonError::into_inner));
 }
 
-fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
-}
-
 impl State {
     /// Re-render at most once per [`TICK`] and queue the result if it changed.
     fn tick(&mut self, now: Instant) {
@@ -214,18 +210,11 @@ impl State {
             self.last_boss = None;
             None
         };
-        let start = match snap.run_secs {
-            Some(secs) if snap.phase != presence::Phase::Menu => {
-                Some(self.clock.start_for(unix_now(), secs))
-            }
-            _ => {
-                self.clock.reset();
-                None
-            }
-        };
-        let desired: Desired =
-            presence::activity(&snap.masked(self.toggles), &self.templates, start)
-                .map(|a| presence::activity_json(&a));
+        let alt = self
+            .rotate
+            .is_some_and(|r| rotation_alt(now.duration_since(self.started), r));
+        let desired: Desired = presence::activity(&snap.masked(self.toggles), &self.templates, alt)
+            .map(|a| presence::activity_json(&a));
         if self.last_sent.as_ref() != Some(&desired) {
             let key = (snap.phase, snap.boss.filter(|_| self.toggles.boss));
             let urgent = self.last_key != Some(key);
@@ -241,6 +230,12 @@ impl State {
             self.last_key = Some(key);
         }
     }
+}
+
+/// Whether the alternate state line is due: every other `period` since start.
+fn rotation_alt(elapsed: Duration, period: Duration) -> bool {
+    let p = period.as_secs().max(1);
+    (elapsed.as_secs() / p) % 2 == 1
 }
 
 /// `level`, `wave` and `playerScore` are GML globals, read from the global
@@ -277,7 +272,7 @@ struct ControllerVars {
 
 /// `count_pauses`: subtract paused time from the run clock (the game's own run
 /// time). Without it the clock is wall time since the run started, so hiding
-/// pauses doesn't make the elapsed counter jump back on resume.
+/// pauses doesn't make `{time}` jump back on resume.
 fn read_controller(call: &Call<'_>, v: &ControllerVars, count_pauses: bool) -> Option<Controller> {
     let me = call.instance()?;
     let flag = |var| me.get_f64(var).is_some_and(|x| x != 0.0);
@@ -334,7 +329,14 @@ fn init(ctx: &ModContext) -> Result<(), Error> {
         .map_err(|e| Error::Other(format!("cannot start Discord thread: {e}")))?;
     let state: Shared = Arc::new(Mutex::new(State {
         tracker: Tracker::default(),
-        clock: ElapsedClock::default(),
+        started: Instant::now(),
+        rotate: (config.rotate_secs > 0).then(|| {
+            Duration::from_secs(
+                config
+                    .rotate_secs
+                    .clamp(MIN_INTERVAL_SECS, MAX_INTERVAL_SECS),
+            )
+        }),
         last_tick: None,
         last_sent: None,
         last_key: None,
@@ -396,23 +398,30 @@ fn init(ctx: &ModContext) -> Result<(), Error> {
     hook_state(ctx, STAR_EATER_STEP, &state, |s, now| {
         s.tracker.on_star_eater_heartbeat(now);
     });
-    let mut boss_hooks = 0;
+    let boss_hooks = hook_bosses(ctx, &state);
+    log::info!("Discord presence on (client {client_id}, {boss_hooks} boss hooks)");
+    Ok(())
+}
+
+/// Hook every boss's Create (and Destroy, where it has one). Returns the
+/// number of hooks installed.
+fn hook_bosses(ctx: &ModContext, state: &Shared) -> usize {
+    let mut n = 0;
     for (i, boss) in BOSSES.iter().enumerate() {
-        if hook_state(ctx, &game::create_event(boss), &state, move |s, now| {
+        if hook_state(ctx, &game::create_event(boss), state, move |s, now| {
             s.tracker.on_boss_created(now, i);
         }) {
-            boss_hooks += 1;
+            n += 1;
         }
         if boss.has_destroy
-            && hook_state(ctx, &game::destroy_event(boss), &state, move |s, _| {
+            && hook_state(ctx, &game::destroy_event(boss), state, move |s, _| {
                 s.tracker.on_boss_destroyed(i);
             })
         {
-            boss_hooks += 1;
+            n += 1;
         }
     }
-    log::info!("Discord presence on (client {client_id}, {boss_hooks} boss hooks)");
-    Ok(())
+    n
 }
 
 ndml_sdk::export_mod!(init, defaults = include_str!("../config.toml"));
@@ -477,15 +486,41 @@ mod tests {
             boss: Some("Dreadnought"),
             hull: Some("Engineer"),
         };
-        let a = presence::activity(&snap.masked(cfg.toggles()), &cfg.templates(), Some(1)).unwrap();
+        let a = presence::activity(&snap.masked(cfg.toggles()), &cfg.templates(), false).unwrap();
         assert_eq!(a.details.as_deref(), Some("Wave 40 · Level 18"));
         assert_eq!(a.state.as_deref(), Some("vs Dreadnought · Score 2,500,000"));
         assert_eq!(a.large_image, None);
 
         // No boss: the hull takes that slot.
         let calm = presence::Snapshot { boss: None, ..snap };
-        let a = presence::activity(&calm.masked(cfg.toggles()), &cfg.templates(), Some(1)).unwrap();
+        let a = presence::activity(&calm.masked(cfg.toggles()), &cfg.templates(), false).unwrap();
         assert_eq!(a.state.as_deref(), Some("Engineer · Score 2,500,000"));
+    }
+
+    #[test]
+    fn state_line_rotates_between_score_and_run_time() {
+        let cfg = defaults();
+        assert_eq!(cfg.rotate_secs, 20);
+        let p = Duration::from_secs(cfg.rotate_secs);
+        assert!(!rotation_alt(Duration::from_secs(5), p));
+        assert!(rotation_alt(Duration::from_secs(25), p));
+        assert!(!rotation_alt(Duration::from_secs(45), p));
+        let snap = presence::Snapshot {
+            phase: presence::Phase::Run,
+            level: Some(18),
+            wave: Some(40),
+            score: Some(2_500_000),
+            run_secs: Some(754),
+            boss: None,
+            hull: Some("Engineer"),
+        };
+        let t = cfg.templates();
+        let a = presence::activity(&snap, &t, false).unwrap();
+        assert_eq!(a.state.as_deref(), Some("Engineer · Score 2,500,000"));
+        let b = presence::activity(&snap, &t, true).unwrap();
+        assert_eq!(b.state.as_deref(), Some("Engineer · Run 12:34"));
+        // No timestamps: Discord keeps its own session playtime.
+        assert!(!presence::activity_json(&a).contains("timestamps"));
     }
 
     #[test]

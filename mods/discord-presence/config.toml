@@ -24,13 +24,10 @@ show_boss = true
 # The chosen hull ("Engineer"), shown when no boss is being fought.
 show_hull = true
 
-# false = no pause indicator: a paused run looks exactly like live play (same
-# text, elapsed counter keeps running; the run clock then includes pauses).
-# true = "Paused" templates below, and the counter hides while paused.
+# false = no pause indicator: a paused run looks exactly like live play (the
+# run time {time} then includes pauses). true = "Paused" templates below.
 show_paused = false
 
-# Discord's own "mm:ss elapsed" counter for the run (stops while paused).
-show_elapsed = true
 # Show "In the menus" when no run is going; false clears the presence there.
 show_in_menu = true
 
@@ -43,6 +40,11 @@ show_in_menu = true
 # line and "state" below.
 run_details = "Wave {wave} | Level {level}"
 run_state = "vs {boss} ~ {hull} | Score {score}"
+# Shown instead of run_state every other rotate_secs, so the line alternates
+# between score and run time. "" = always run_state.
+run_state_alt = "vs {boss} ~ {hull} | Run {time}"
+# Seconds each of the two lines stays up. 0 = no rotation; else clamped to [5, 300].
+rotate_secs = 20
 # Used only with show_paused = true.
 paused_details = "Paused | Wave {wave} | Level {level}"
 paused_state = "vs {boss} ~ {hull} | Score {score}"

@@ -106,8 +106,6 @@ impl Snapshot {
 pub struct Activity {
     pub details: Option<String>,
     pub state: Option<String>,
-    /// Unix seconds; Discord renders "mm:ss elapsed" counting from it.
-    pub start: Option<u64>,
     pub large_image: Option<String>,
     pub large_text: Option<String>,
 }
@@ -201,6 +199,9 @@ pub fn render(template: &str, snap: &Snapshot, thousands_sep: &str) -> Option<St
 pub struct Templates {
     pub run_details: String,
     pub run_state: String,
+    /// Shown instead of `run_state` every other rotation period (see
+    /// [`activity`]); empty = no rotation.
+    pub run_state_alt: String,
     pub paused_details: String,
     pub paused_state: String,
     pub game_over_details: String,
@@ -208,7 +209,6 @@ pub struct Templates {
     pub menu_details: String,
     pub menu_state: String,
     pub show_in_menu: bool,
-    pub show_elapsed: bool,
     pub large_image: String,
     pub large_text: String,
     pub thousands_separator: String,
@@ -217,15 +217,20 @@ pub struct Templates {
 /// Shown when a run template renders to nothing (e.g. all values switched off).
 pub const RUN_FALLBACK: &str = "In a run";
 
-/// Build the activity for `snap`. `run_start` is the Unix time the elapsed
-/// counter should start at (see [`ElapsedClock`]). `None` = clear the presence.
+/// Build the activity for `snap`. `alt` selects `run_state_alt` instead of
+/// `run_state` during a run. `None` = clear the presence. No timestamps are
+/// sent: Discord tracks the session playtime itself, and a timestamp would
+/// replace it.
 #[must_use]
-pub fn activity(snap: &Snapshot, t: &Templates, run_start: Option<u64>) -> Option<Activity> {
+pub fn activity(snap: &Snapshot, t: &Templates, alt: bool) -> Option<Activity> {
     let sep = t.thousands_separator.as_str();
     let field = |tpl: &str| render(tpl, snap, sep).as_deref().and_then(clamp_text);
     let (details, state) = match snap.phase {
         Phase::Menu if !t.show_in_menu => return None,
         Phase::Menu => (&t.menu_details, &t.menu_state),
+        Phase::Run if alt && !t.run_state_alt.trim().is_empty() => {
+            (&t.run_details, &t.run_state_alt)
+        }
         Phase::Run => (&t.run_details, &t.run_state),
         Phase::Paused => (&t.paused_details, &t.paused_state),
         Phase::GameOver => (&t.game_over_details, &t.game_over_state),
@@ -235,14 +240,9 @@ pub fn activity(snap: &Snapshot, t: &Templates, run_start: Option<u64>) -> Optio
         state: field(state),
         large_image: clamp_text(&t.large_image),
         large_text: clamp_text(&t.large_text),
-        ..Activity::default()
     };
     if snap.phase != Phase::Menu && a.details.is_none() && a.state.is_none() {
         a.details = Some(RUN_FALLBACK.to_owned());
-    }
-    // Discord can't freeze its counter, so it only runs during live play.
-    if t.show_elapsed && snap.phase == Phase::Run {
-        a.start = run_start;
     }
     Some(a)
 }
@@ -257,9 +257,6 @@ pub fn activity_json(a: &Activity) -> String {
     if let Some(s) = &a.state {
         parts.push(format!(r#""state":{}"#, json_str(s)));
     }
-    if let Some(start) = a.start {
-        parts.push(format!(r#""timestamps":{{"start":{start}}}"#));
-    }
     if let Some(img) = &a.large_image {
         let text = a
             .large_text
@@ -272,34 +269,6 @@ pub fn activity_json(a: &Activity) -> String {
         ));
     }
     format!("{{{}}}", parts.join(","))
-}
-
-/// Keeps Discord's elapsed counter stable: the start time only moves when the
-/// run clock and the stored start disagree by more than [`Self::TOLERANCE`] seconds (after
-/// a pause, a loaded save, or a new run), so updates don't make it jitter.
-#[derive(Debug, Default)]
-pub struct ElapsedClock {
-    start: Option<u64>,
-}
-
-impl ElapsedClock {
-    pub const TOLERANCE: u64 = 3;
-
-    /// Start time for a run that has lasted `run_secs` at Unix time `now`.
-    pub fn start_for(&mut self, now: u64, run_secs: u64) -> u64 {
-        let wanted = now.saturating_sub(run_secs);
-        match self.start {
-            Some(s) if s.abs_diff(wanted) <= Self::TOLERANCE => s,
-            _ => {
-                self.start = Some(wanted);
-                wanted
-            }
-        }
-    }
-
-    pub fn reset(&mut self) {
-        self.start = None;
-    }
 }
 
 #[cfg(test)]
@@ -322,6 +291,7 @@ mod tests {
         Templates {
             run_details: "Wave {wave} | Level {level}".into(),
             run_state: "vs {boss} | Score {score}".into(),
+            run_state_alt: "vs {boss} | Run {time}".into(),
             paused_details: "Paused | Wave {wave}".into(),
             paused_state: "Score {score}".into(),
             game_over_details: "Run over | Wave {wave}".into(),
@@ -329,7 +299,6 @@ mod tests {
             menu_details: "In the menus".into(),
             menu_state: String::new(),
             show_in_menu: true,
-            show_elapsed: true,
             large_image: "logo".into(),
             large_text: "Nova Drift".into(),
             thousands_separator: ",".into(),
@@ -447,13 +416,12 @@ mod tests {
 
     #[test]
     fn run_activity() {
-        let a = activity(&snap(Phase::Run), &templates(), Some(1000)).unwrap();
+        let a = activity(&snap(Phase::Run), &templates(), false).unwrap();
         assert_eq!(a.details.as_deref(), Some("Wave 23 · Level 12"));
         assert_eq!(a.state.as_deref(), Some("Score 1,234,567"));
-        assert_eq!(a.start, Some(1000));
         assert_eq!(
             activity_json(&a),
-            r#"{"details":"Wave 23 · Level 12","state":"Score 1,234,567","timestamps":{"start":1000},"assets":{"large_image":"logo","large_text":"Nova Drift"}}"#
+            r#"{"details":"Wave 23 · Level 12","state":"Score 1,234,567","assets":{"large_image":"logo","large_text":"Nova Drift"}}"#
         );
     }
 
@@ -465,22 +433,20 @@ mod tests {
             score: None,
             ..snap(Phase::Run)
         };
-        let a = activity(&s, &templates(), None).unwrap();
+        let a = activity(&s, &templates(), false).unwrap();
         assert_eq!(a.details.as_deref(), Some(RUN_FALLBACK));
         assert_eq!(a.state, None);
     }
 
     #[test]
     fn other_phases() {
-        let p = activity(&snap(Phase::Paused), &templates(), Some(1000)).unwrap();
+        let p = activity(&snap(Phase::Paused), &templates(), false).unwrap();
         assert_eq!(p.details.as_deref(), Some("Paused · Wave 23"));
-        assert_eq!(p.start, None);
 
-        let g = activity(&snap(Phase::GameOver), &templates(), Some(1000)).unwrap();
+        let g = activity(&snap(Phase::GameOver), &templates(), false).unwrap();
         assert_eq!(g.state.as_deref(), Some("Final score 1,234,567"));
-        assert_eq!(g.start, None);
 
-        let m = activity(&snap(Phase::Menu), &templates(), None).unwrap();
+        let m = activity(&snap(Phase::Menu), &templates(), false).unwrap();
         assert_eq!(m.details.as_deref(), Some("In the menus"));
         assert_eq!(m.state, None);
 
@@ -488,21 +454,11 @@ mod tests {
             show_in_menu: false,
             ..templates()
         };
-        assert_eq!(activity(&snap(Phase::Menu), &hidden, None), None);
+        assert_eq!(activity(&snap(Phase::Menu), &hidden, false), None);
     }
 
     #[test]
     fn empty_activity_json() {
         assert_eq!(activity_json(&Activity::default()), "{}");
-    }
-
-    #[test]
-    fn elapsed_clock_is_stable() {
-        let mut c = ElapsedClock::default();
-        assert_eq!(c.start_for(1_000, 100), 900);
-        assert_eq!(c.start_for(1_010, 109), 900); // 1 s drift: keep
-        assert_eq!(c.start_for(1_100, 100), 1_000); // paused 100 s: move
-        c.reset();
-        assert_eq!(c.start_for(5_000, 0), 5_000);
     }
 }
