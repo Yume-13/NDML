@@ -1,0 +1,5 @@
+# Magnet Range: XP orbs and power-ups fly to you from farther away.
+
+# How far pickups are pulled from, times the game's range. 1.0 = vanilla;
+# above 0, at most 50.
+range_multiplier = 3.0

@@ -1,0 +1,51 @@
+# Discord Presence: shows your run's wave, level, score and time on your Discord
+# profile. Needs the Discord desktop app on this PC.
+
+# Turn the presence on or off.
+enabled = true
+
+# Which values to show. A value turned off drops the template part that uses it.
+show_level = true
+show_wave = true
+show_score = true
+show_time = true
+show_boss = true
+# Show your hull (e.g. "Engineer") when no boss is being fought.
+show_hull = true
+
+# Show the "Paused" templates while a run is paused. false = a paused run
+# shows as play (its time then counts the pause).
+show_paused = false
+
+# Show "In the menus" outside a run. false = no presence there.
+show_in_menu = true
+
+# Templates: {level} {wave} {score} {time} {boss} {hull}. "|" separates parts; a
+# part with a missing value is left out, the rest joined with " · ". "~"
+# separates choices; the first with all its values shows. "details" is
+# Discord's first line, "state" its second.
+run_details = "Wave {wave} | Level {level}"
+run_state = "vs {boss} ~ {hull} | Score {score}"
+# Shown instead of run_state every other rotate_secs. "" = always run_state.
+run_state_alt = "vs {boss} ~ {hull} | Run {time}"
+# Seconds each state line stays up. 0 = no rotation; else 5-300.
+rotate_secs = 20
+# Shown while paused, with show_paused = true.
+paused_details = "Paused | Wave {wave} | Level {level}"
+paused_state = "vs {boss} ~ {hull} | Score {score}"
+# Shown when a run is over.
+game_over_details = "Run over | Wave {wave} | Level {level}"
+game_over_state = "Final score {score}"
+# Shown in the menus.
+menu_details = "In the menus"
+menu_state = ""
+
+# Digit grouping in {score}: "," gives 1,234,567. "" = none.
+thousands_separator = ","
+
+# Seconds between routine updates. 5-300; boss fights, run start and run end
+# go out at once.
+update_interval_secs = 5
+
+# Seconds "vs <boss>" stays up after the boss dies. 0 = off; at most 120.
+boss_linger_secs = 10
