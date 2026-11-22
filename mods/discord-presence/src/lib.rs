@@ -47,7 +47,7 @@ pub mod presence;
 pub mod worker;
 
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ndml_sdk::{Call, Error, ModContext, Variable};
 use serde::Deserialize;
@@ -159,6 +159,9 @@ impl Config {
 struct State {
     tracker: Tracker,
     started: Instant,
+    /// The game session's start in Unix seconds, read once in [`init`] and
+    /// sent unchanged with every activity (see [`presence::activity_json`]).
+    session_start: Option<u64>,
     rotate: Option<Duration>,
     last_tick: Option<Instant>,
     last_sent: Option<Desired>,
@@ -201,7 +204,7 @@ impl State {
             .rotate
             .is_some_and(|r| rotation_alt(now.duration_since(self.started), r));
         let desired: Desired = presence::activity(&snap.masked(self.toggles), &self.templates, alt)
-            .map(|a| presence::activity_json(&a));
+            .map(|a| presence::activity_json(&a, self.session_start));
         if self.last_sent.as_ref() != Some(&desired) {
             let key = (snap.phase, snap.boss.filter(|_| self.toggles.boss));
             let urgent = self.last_key != Some(key);
@@ -223,6 +226,16 @@ impl State {
 fn rotation_alt(elapsed: Duration, period: Duration) -> bool {
     let p = period.as_secs().max(1);
     (elapsed.as_secs() / p) % 2 == 1
+}
+
+/// Now in Unix seconds from the system clock; `None` (logged) for a clock
+/// before 1970, so no timestamps are sent rather than a wrong one.
+fn unix_now_secs() -> Option<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .map_err(|e| log::warn!("unable to read the system clock ({e}); no elapsed time shown"))
+        .ok()
 }
 
 /// `level`, `wave` and `playerScore` are GML globals, read from the global
@@ -309,6 +322,7 @@ fn init(ctx: &ModContext) -> Result<(), Error> {
     let state: Shared = Arc::new(Mutex::new(State {
         tracker: Tracker::default(),
         started: Instant::now(),
+        session_start: unix_now_secs(),
         rotate: (config.rotate_secs > 0).then(|| {
             Duration::from_secs(
                 config
@@ -518,7 +532,7 @@ mod tests {
         assert_eq!(a.details.as_deref(), Some("Wave 40 · Level 18"));
         assert_eq!(a.state.as_deref(), Some("vs Dreadnought · Score 2,500,000"));
         assert!(
-            !presence::activity_json(&a).contains("assets"),
+            !presence::activity_json(&a, Some(1_795_000_000)).contains("assets"),
             "no picture"
         );
 
@@ -550,8 +564,12 @@ mod tests {
         assert_eq!(a.state.as_deref(), Some("Engineer · Score 2,500,000"));
         let b = presence::activity(&snap, &t, true).unwrap();
         assert_eq!(b.state.as_deref(), Some("Engineer · Run 12:34"));
-        // No timestamps: Discord keeps its own session playtime.
-        assert!(!presence::activity_json(&a).contains("timestamps"));
+        // Both lines carry the same session start: the rotation does not
+        // restart the time Discord shows.
+        let start = Some(1_795_000_000);
+        let ts = r#""timestamps":{"start":1795000000}"#;
+        assert!(presence::activity_json(&a, start).contains(ts));
+        assert!(presence::activity_json(&b, start).contains(ts));
     }
 
     #[test]

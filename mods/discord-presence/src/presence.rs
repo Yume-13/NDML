@@ -212,9 +212,9 @@ pub struct Templates {
 pub const RUN_FALLBACK: &str = "In a run";
 
 /// Build the activity for `snap`. `alt` selects `run_state_alt` instead of
-/// `run_state` during a run. `None` = clear the presence. No timestamps are
-/// sent: Discord tracks the session playtime itself, and a timestamp would
-/// replace it. No picture either: Nova Drift's Discord app has none.
+/// `run_state` during a run. `None` = clear the presence. No picture: Nova
+/// Drift's Discord app has none. The elapsed time comes from the session
+/// start [`activity_json`] adds.
 #[must_use]
 pub fn activity(snap: &Snapshot, t: &Templates, alt: bool) -> Option<Activity> {
     let sep = t.thousands_separator.as_str();
@@ -240,14 +240,22 @@ pub fn activity(snap: &Snapshot, t: &Templates, alt: bool) -> Option<Activity> {
 }
 
 /// The activity as a Discord JSON object.
+///
+/// `session_start` is when the game session started, in Unix seconds, sent
+/// as `timestamps.start`. It must be the same value in every update: an
+/// activity without a start makes Discord restart the "time playing" it
+/// shows at each update. `None` (clock unreadable) sends no timestamps.
 #[must_use]
-pub fn activity_json(a: &Activity) -> String {
+pub fn activity_json(a: &Activity, session_start: Option<u64>) -> String {
     let mut parts = Vec::new();
     if let Some(d) = &a.details {
         parts.push(format!(r#""details":{}"#, json_str(d)));
     }
     if let Some(s) = &a.state {
         parts.push(format!(r#""state":{}"#, json_str(s)));
+    }
+    if let Some(start) = session_start {
+        parts.push(format!(r#""timestamps":{{"start":{start}}}"#));
     }
     format!("{{{}}}", parts.join(","))
 }
@@ -399,9 +407,56 @@ mod tests {
         assert_eq!(a.details.as_deref(), Some("Wave 23 · Level 12"));
         assert_eq!(a.state.as_deref(), Some("Score 1,234,567"));
         assert_eq!(
-            activity_json(&a),
-            r#"{"details":"Wave 23 · Level 12","state":"Score 1,234,567"}"#
+            activity_json(&a, Some(START)),
+            r#"{"details":"Wave 23 · Level 12","state":"Score 1,234,567","timestamps":{"start":1795000000}}"#
         );
+    }
+
+    /// A session start in Unix seconds.
+    const START: u64 = 1_795_000_000;
+
+    /// Menu, run and boss fight all carry the same session start, so the
+    /// time Discord shows keeps counting through status changes.
+    #[test]
+    fn every_activity_carries_the_same_session_start() {
+        let t = templates();
+        let boss = Snapshot {
+            boss: Some("Star Eater"),
+            ..snap(Phase::Run)
+        };
+        let shown = [
+            activity(&snap(Phase::Menu), &t, false),
+            activity(&snap(Phase::Run), &t, false),
+            activity(&boss, &t, false),
+            activity(&snap(Phase::GameOver), &t, false),
+        ];
+        let jsons: Vec<String> = shown
+            .iter()
+            .map(|a| activity_json(a.as_ref().unwrap(), Some(START)))
+            .collect();
+        for j in &jsons {
+            assert!(j.ends_with(r#","timestamps":{"start":1795000000}}"#), "{j}");
+        }
+        assert!(jsons[2].contains("vs Star Eater"), "{}", jsons[2]);
+    }
+
+    /// A clear stays a clear: no activity, so no timestamps either.
+    #[test]
+    fn a_clear_still_clears() {
+        let hidden = Templates {
+            show_in_menu: false,
+            ..templates()
+        };
+        let desired =
+            activity(&snap(Phase::Menu), &hidden, false).map(|a| activity_json(&a, Some(START)));
+        assert_eq!(desired, None);
+    }
+
+    /// An unreadable clock sends no timestamps rather than a wrong one.
+    #[test]
+    fn no_start_no_timestamps() {
+        let a = activity(&snap(Phase::Run), &templates(), false).unwrap();
+        assert!(!activity_json(&a, None).contains("timestamps"));
     }
 
     #[test]
@@ -438,6 +493,6 @@ mod tests {
 
     #[test]
     fn empty_activity_json() {
-        assert_eq!(activity_json(&Activity::default()), "{}");
+        assert_eq!(activity_json(&Activity::default(), None), "{}");
     }
 }
