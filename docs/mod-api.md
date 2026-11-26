@@ -126,6 +126,14 @@ Hooks can only be added during init, at most 512 hooked functions for all mods t
 Callbacks must be `Send + Sync + 'static`. Several mods may hook the same function;
 callbacks run in mod load order around the original.
 
+A function whose first bytes the loader's detour cannot move (one that starts with a
+call, for example) can't be hooked: the hook methods return
+`Err(Error::Hook { status: Status::Unsupported, .. })` and the loader logs the reason. A
+mod that passes the error on with `?` fails its init. Rarely, a hook accepted at init
+cannot be installed when the loader enables the hooks (no code memory within reach of
+the function, for example); the loader then logs `hook <name> refused: ...` and that function runs
+unhooked.
+
 ### `Call` (inside a hook)
 
 | Method | |
@@ -156,6 +164,7 @@ function called (yours included).
 | `builtin(name)`, `builtin_f64(name)`, `builtin_value(name)` | Read a built-in variable by name: `x`, `y`, `speed`, `hspeed`, `vspeed`, `direction`, `image_angle`, `room_width`, `current_time`, … |
 | `set_builtin_f64(name, v)` | Write a built-in through the runtime's setter. `Err(Status::ReadOnly)` for read-only built-ins. |
 | `call_script(script, args)`, `call_builtin(builtin, args)` | Run game code with this instance as `self`. |
+| `with(target, f)` | GML `with (target)` with this instance as `other`, as `Call::with` does: how code that holds only an instance (an event observer) reaches another one by id. |
 | `key()` | An identity for per-instance state, stable while the instance exists. |
 
 `Variable`, `Script` and `Builtin` are cheap `Copy` handles; resolve them once in init
@@ -208,7 +217,24 @@ mod that must call code that may fail asks for the guard in init with
 
 Use the `log` crate (`log::info!`, `log::debug!`, …). Output goes to
 `ndml/logs/ndml.log`, prefixed with the mod name, filtered by `log_level` in
-`ndml/ndml.toml`. Keep per-frame logging at `trace`.
+`ndml/ndml.toml`; the last nine launches' logs are kept beside it. Keep per-frame
+logging at `trace`.
+
+### Timing (`ndml_sdk::profile`)
+
+Off unless the mod turns it on; while off, each hook call costs one atomic load. The
+state is per mod DLL, and the rustdoc is the reference.
+
+* `profile::enable(true)` times every hook and observer the mod registered (before and
+  after apart, with call counts). Call `profile::frame(Instant::now())` once a frame
+  from the same place: it returns the frame that just ended (`Frame::line(top)` gives
+  one line: wall time, the mod's time, the remainder, spans and the largest hooks).
+* Sections of the mod's own code: `static WORK: Span = Span::new("work");`, then
+  `profile::span(&WORK, || ...)`, or `let _t = profile::enter(&WORK);` (an `Entered`
+  guard, timed until it drops) for code that is not one closure.
+* `profile::time_sides(true)` keeps only two sums, the mod's time in step-side and in
+  draw-side hooks (draw events, observers of draw events, `draw_` builtins);
+  `profile::take_sides()` returns them and resets them.
 
 ## 4. Config
 

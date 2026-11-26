@@ -760,7 +760,7 @@ fn draw_log(f: &mut Frame<'_>, app: &App, area: Rect) {
         let p = Paragraph::new(vec![
             Line::from(""),
             Line::styled(
-                "  No log yet. The loader writes ndml/logs/ndml.log each time the game starts.",
+                "  No log yet. The loader writes ndml/logs/ndml.log while the game runs.",
                 theme::dim(),
             ),
             Line::styled("  Press [G] to launch Nova Drift.", Style::new().fg(GREEN)),
@@ -1087,7 +1087,7 @@ fn draw_help(f: &mut Frame<'_>, area: Rect) {
         ),
         Line::styled("  ndml/config/          per-mod settings", theme::dim()),
         Line::styled(
-            "  ndml/logs/ndml.log    rewritten every launch",
+            "  ndml/logs/            ndml.log for this launch, the last nine dated beside it",
             theme::dim(),
         ),
         Line::from(""),
@@ -1828,7 +1828,7 @@ key{i:02} = 1.0"
     #[test]
     fn log_lines_wrap_under_a_hanging_indent() {
         let line = log_line(
-            "[    1.204] WARN  ndmod_test: unable to hook gml_Object_oDrawEndScore_Draw_64 (not found)",
+            "[    1.204] WARN  ndmod_test: unable to hook gml_Object_oWidgetsPanel_Draw_64 (not found)",
         );
         let rows = wrap_spans(&line.spans, 40, 18);
         let text: Vec<String> = rows
@@ -1842,7 +1842,7 @@ key{i:02} = 1.0"
         );
         assert!(text.iter().all(|t| t.chars().count() <= 40), "{text:?}");
         let joined: String = text.iter().map(|t| t.trim()).collect::<Vec<_>>().join(" ");
-        assert!(joined.contains("gml_Object_oDrawEn"), "{text:?}");
+        assert!(joined.contains("gml_Object_oWidget"), "{text:?}");
     }
 
     /// A key longer than its column is cut with `…` (the row keeps its

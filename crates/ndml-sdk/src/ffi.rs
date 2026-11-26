@@ -1010,6 +1010,23 @@ impl Instance<'_> {
             })
     }
 
+    /// Run `f` for each instance `target` names (an id, an object index or
+    /// `all`), with this instance as `other`, as [`Call::with`] does: how
+    /// code that holds only an instance (an event observer) reaches another
+    /// one by id. Same caveats as [`Call::with`].
+    pub fn with(
+        &self,
+        target: &Value,
+        mut f: impl FnMut(Instance<'_>, Option<Instance<'_>>),
+    ) -> Result<u32, crate::Error> {
+        self.target()
+            .with_each(target, &mut f)
+            .map_err(|status| crate::Error::Call {
+                function: "with".to_owned(),
+                status,
+            })
+    }
+
     fn target(&self) -> Target {
         Target {
             host: self.host,

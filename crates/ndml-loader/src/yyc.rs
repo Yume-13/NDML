@@ -730,14 +730,14 @@ mod tests {
             ],
         };
         let mut img = vec![0u8; 0x4000];
-        put_s(&mut img, 0x2000, "gml_Script_powerupAttract");
-        put_s(&mut img, 0x2100, "magDist");
+        put_s(&mut img, 0x2000, "gml_Script_widgetPull");
+        put_s(&mut img, 0x2100, "pullDist");
         put_s(&mut img, 0x2200, "not an ident");
         // function entry
         put_q(&mut img, 0x3000, BASE + 0x2000);
         put_q(&mut img, 0x3008, BASE + 0x1234);
         put_q(&mut img, 0x3010, BASE + 0x3100);
-        // YYVAR magDist
+        // YYVAR pullDist
         put_q(&mut img, 0x3040, BASE + 0x2100);
         img[0x3048..0x304c].copy_from_slice(&u32::MAX.to_le_bytes());
         // YYVAR with a bad name is ignored
@@ -757,8 +757,8 @@ mod tests {
             &layout,
         )
         .unwrap();
-        assert_eq!(idx.functions["gml_Script_powerupAttract"], BASE + 0x1234);
-        assert_eq!(idx.variables["magDist"], BASE + 0x3048);
+        assert_eq!(idx.functions["gml_Script_widgetPull"], BASE + 0x1234);
+        assert_eq!(idx.variables["pullDist"], BASE + 0x3048);
         assert_eq!(idx.variables.len(), 1);
     }
 
@@ -843,7 +843,7 @@ mod tests {
 
     #[test]
     fn identifier_rules() {
-        assert!(is_identifier("magDist"));
+        assert!(is_identifier("pullDist"));
         assert!(is_identifier("_x1"));
         assert!(!is_identifier("1x"));
         assert!(!is_identifier("a b"));
@@ -859,7 +859,8 @@ mod tests {
 
     #[test]
     fn finds_rvalue_free_by_guard_shape() {
-        // `test dl, 0x46` / `test al, 0x46`; `je +8`; `mov rcx, rdi`; `call X`.
+        // The shape the matcher looks for: `test dl, 0x46` / `test al, 0x46`;
+        // `je +8`; `mov rcx, rdi`; `call X`.
         let site = |img: &mut Vec<u8>, at: usize, target: usize, al: bool| {
             let g = if al {
                 img[at..at + 2].copy_from_slice(&[0xA8, 0x46]);
@@ -913,15 +914,15 @@ mod tests {
         let mut d = vec![0u8; 0x100];
         // Decoy: count without a heap pointer.
         d[0x10..0x18].copy_from_slice(&(BASE as u64 + 0x3100).to_le_bytes());
-        d[0x18..0x1c].copy_from_slice(&2774u32.to_le_bytes());
-        d[0x1c..0x20].copy_from_slice(&3000u32.to_le_bytes());
+        d[0x18..0x1c].copy_from_slice(&1600u32.to_le_bytes());
+        d[0x1c..0x20].copy_from_slice(&2000u32.to_le_bytes());
         // Real header.
         d[0x40..0x48].copy_from_slice(&0x2_5000_0010u64.to_le_bytes());
-        d[0x48..0x4c].copy_from_slice(&2774u32.to_le_bytes());
-        d[0x4c..0x50].copy_from_slice(&3000u32.to_le_bytes());
+        d[0x48..0x4c].copy_from_slice(&1600u32.to_le_bytes());
+        d[0x4c..0x50].copy_from_slice(&2000u32.to_le_bytes());
         // Decoy: capacity below count.
         d[0x60..0x68].copy_from_slice(&0x2_5000_0010u64.to_le_bytes());
-        d[0x68..0x6c].copy_from_slice(&2774u32.to_le_bytes());
+        d[0x68..0x6c].copy_from_slice(&1600u32.to_le_bytes());
         d[0x6c..0x70].copy_from_slice(&100u32.to_le_bytes());
         assert_eq!(
             function_table_candidates(&d, data_addr, &image),
@@ -1086,14 +1087,14 @@ mod tests {
         );
     }
 
-    /// The argument setup compiled `with` code uses, with the call classified
-    /// by what follows it.
+    /// The shape the `with` matcher looks for: the argument setup before the
+    /// call, and the call classified by what follows it.
     #[test]
     fn classifies_with_calls() {
-        // lea r8,[rbp+0xb58]; lea rdx,[rbp+0xb50]; lea rcx,[rbp+0x320]
+        // lea r8,[rbp+0x6c8]; lea rdx,[rbp+0x6c0]; lea rcx,[rbp+0x1e0] (made-up slots)
         let setup: &[u8] = &[
-            0x4C, 0x8D, 0x85, 0x58, 0x0B, 0, 0, 0x48, 0x8D, 0x95, 0x50, 0x0B, 0, 0, 0x48, 0x8D,
-            0x8D, 0x20, 0x03, 0, 0,
+            0x4C, 0x8D, 0x85, 0xC8, 0x06, 0, 0, 0x48, 0x8D, 0x95, 0xC0, 0x06, 0, 0, 0x48, 0x8D,
+            0x8D, 0xE0, 0x01, 0, 0,
         ];
         let call = |rel: i32| {
             let mut v = vec![0xE8];
@@ -1118,16 +1119,16 @@ mod tests {
             classify_with_call(&site(&[0x33, 0xF6, 0x85, 0xC0, 0x7E, 0x00]), j),
             Some((0, target))
         );
-        // end: nop; lea rcx,[rbp+0x320]; call free
-        let mut end = vec![0x90, 0x48, 0x8D, 0x8D, 0x20, 0x03, 0, 0];
+        // end: nop; lea rcx,[rbp+0x1e0]; call free
+        let mut end = vec![0x90, 0x48, 0x8D, 0x8D, 0xE0, 0x01, 0, 0];
         end.extend(call(0x10));
         assert_eq!(classify_with_call(&site(&end), j), Some((2, target)));
         // Different iterator in the free call: not an end site.
-        end[4] = 0x28;
+        end[4] = 0xF0;
         assert_eq!(classify_with_call(&site(&end), j), None);
         // Mismatched self/other slots: not a with call.
         let mut bad = site(&[0x84, 0xC0]);
-        bad[3] = 0x60;
+        bad[3] = 0xD0;
         assert_eq!(classify_with_call(&bad, j), None);
     }
 }

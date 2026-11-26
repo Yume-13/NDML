@@ -47,8 +47,132 @@ use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use ndml_sdk::abi::{CInstance, EventSeen, HookCall, HookCallback, RValue, Status};
-use retour::RawDetour;
 use seq_macro::seq;
+
+use crate::detour::{self, Calls, PATCH_LEN, Plan, Refusal};
+use crate::win;
+
+// ---- Inline detours: the memory side (the decoding is `crate::detour`) ----
+
+/// Why a detour was not built.
+#[derive(Debug)]
+pub enum DetourError {
+    /// The function's first bytes cannot be moved (`crate::detour`).
+    Refused { refusal: Refusal, bytes: Vec<u8> },
+    /// Memory: the target unreadable, no room within reach, a failed write.
+    Failed(String),
+}
+
+impl std::fmt::Display for DetourError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused { refusal, bytes } => write!(
+                f,
+                "its first bytes cannot be moved ({refusal}; first bytes {})",
+                detour::hex(bytes.get(..16).unwrap_or(bytes))
+            ),
+            Self::Failed(why) => f.write_str(why),
+        }
+    }
+}
+
+/// Read `target`'s first bytes and decide what a detour there would copy.
+fn detour_plan(target: usize, calls: Calls) -> Result<(Vec<u8>, Plan), DetourError> {
+    let code = win::read_code(target, detour::READ_LEN)
+        .ok_or_else(|| DetourError::Failed("the target is not executable code".to_owned()))?;
+    match detour::plan(&code, target as u64, calls) {
+        Ok(plan) => Ok((code, plan)),
+        Err(refusal) => Err(DetourError::Refused {
+            refusal,
+            bytes: code,
+        }),
+    }
+}
+
+/// An inline detour, built: its relay and trampoline written, the target not
+/// patched until [`Detour::enable`]. Lives for the process (nothing unhooks).
+#[derive(Debug)]
+pub struct Detour {
+    target: usize,
+    patch: [u8; PATCH_LEN],
+    trampoline: usize,
+    plan: Plan,
+}
+
+impl Detour {
+    /// Build a detour from `target` to `replacement`: refused when the
+    /// target's first bytes cannot be moved, failed when memory cannot be
+    /// had; either way nothing at the target has changed.
+    pub fn new(target: usize, replacement: usize, calls: Calls) -> Result<Self, DetourError> {
+        let (code, plan) = detour_plan(target, calls)?;
+        let failed = |why: &str| DetourError::Failed(why.to_owned());
+        // The relay, padded to 16 bytes, then the trampoline.
+        let relay_at =
+            win::alloc_code_near(target, 16 + detour::TRAMPOLINE_MAX, detour::NEAR as usize)
+                .ok_or_else(|| failed("no free memory within reach of the target"))?;
+        let trampoline = relay_at + 16;
+        let tramp =
+            detour::emit(&plan, &code, target as u64, trampoline as u64).map_err(|refusal| {
+                DetourError::Refused {
+                    refusal,
+                    bytes: code.clone(),
+                }
+            })?;
+        let patch = detour::patch(target as u64, relay_at as u64)
+            .ok_or_else(|| failed("the relay is out of reach of the target"))?;
+        let mut block = detour::relay(replacement as u64).to_vec();
+        block.resize(16, 0xCC);
+        block.extend_from_slice(&tramp);
+        // SAFETY: fresh memory from `alloc_code_near`, which nothing jumps to
+        // until the target is patched; `block` is the relay and a trampoline
+        // built for exactly this address.
+        unsafe { win::write_code(relay_at, &block) }.map_err(DetourError::Failed)?;
+        Ok(Self {
+            target,
+            patch,
+            trampoline,
+            plan,
+        })
+    }
+
+    /// The trampoline: calling it runs the original function.
+    #[must_use]
+    pub fn trampoline(&self) -> usize {
+        self.trampoline
+    }
+
+    /// What the trampoline copied.
+    #[must_use]
+    pub fn plan(&self) -> &Plan {
+        &self.plan
+    }
+
+    /// Patch the target: from now on calls go to the replacement.
+    ///
+    /// # Safety
+    /// No thread may be running the target's first [`PATCH_LEN`] bytes while
+    /// they are written (boot: game code not started), and the trampoline
+    /// must be published wherever the replacement reads it.
+    pub unsafe fn enable(&self) -> Result<(), String> {
+        // SAFETY: the caller's contract; the patch is one `jmp rel32` over
+        // whole instructions the trampoline copied (or padding).
+        unsafe { win::write_code(self.target, &self.patch) }
+    }
+}
+
+/// A registration refused: the status the mod gets and, when the function
+/// cannot be detoured, why.
+#[derive(Debug)]
+pub struct Refused {
+    pub status: Status,
+    pub why: Option<String>,
+}
+
+impl From<Status> for Refused {
+    fn from(status: Status) -> Self {
+        Self { status, why: None }
+    }
+}
 
 /// Maximum number of distinct hooked functions, events and scripts together.
 ///
@@ -204,32 +328,41 @@ static REGISTRY: Mutex<Registry> = Mutex::new(Registry {
 static SITES: OnceLock<Box<[Site]>> = OnceLock::new();
 
 /// Add `cb` to the chain for `name`. Chains run in registration order
-/// (= mod load order): the first registered callback is outermost.
+/// (= mod load order): the first registered callback is outermost. A function
+/// the detour cannot move returns `Unsupported` with the reason. A detour
+/// that cannot be built at [`install`] is logged and left out.
 pub fn register(
     index: &crate::yyc::RunnerIndex,
     mod_id: u32,
     name: &str,
     cb: HookCallback,
     user: *mut c_void,
-) -> Status {
+) -> Result<(), Refused> {
     let Some(kind) = Kind::of(name) else {
-        return Status::Unsupported;
+        return Err(Status::Unsupported.into());
     };
     let target = match kind {
-        Kind::Builtin => match crate::host::builtin_routine(&name[BUILTIN_PREFIX.len()..]) {
-            Ok(t) => t,
-            Err(s) => return s,
-        },
+        Kind::Builtin => crate::host::builtin_routine(&name[BUILTIN_PREFIX.len()..])?,
         Kind::Event | Kind::Script => match index.functions.get(name) {
             Some(&t) => t,
-            None => return Status::NotFound,
+            None => return Err(Status::NotFound.into()),
         },
     };
+    if let Err(e) = detour_plan(target, Calls::Refuse) {
+        return Err(Refused {
+            status: Status::Unsupported,
+            why: Some(e.to_string()),
+        });
+    }
     let link = Link { cb, user, mod_id };
-    REGISTRY
+    match REGISTRY
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .add(name, kind, target, link)
+    {
+        Status::Ok => Ok(()),
+        s => Err(s.into()),
+    }
 }
 
 /// Drop every hook `mod_id` registered: its init failed, so none of it may
@@ -294,48 +427,68 @@ seq!(N in 0..512 {
 // `HookCall::site` is a `u32` and the thunks store `N as u32`.
 const _: () = assert!(MAX_SITES <= u32::MAX as usize);
 
-/// Freeze registration and enable all detours. Returns the number of sites.
+/// Freeze registration and enable all detours. Returns the number of sites
+/// active. A site whose detour cannot be built or enabled is logged
+/// (`hook <name> refused: ...`) and left out; the others are installed.
 pub fn install() -> Result<usize, String> {
     let mut reg = REGISTRY.lock().unwrap_or_else(PoisonError::into_inner);
     reg.frozen = true;
     let mut sites = std::mem::take(&mut reg.sites);
     drop(reg);
 
-    let mut detours = Vec::with_capacity(sites.len());
-    for (i, site) in sites.iter_mut().enumerate() {
-        let thunk = match site.kind {
-            Kind::Event => EVENT_THUNKS[i] as *const (),
-            Kind::Script => SCRIPT_THUNKS[i] as *const (),
-            Kind::Builtin => BUILTIN_THUNKS[i] as *const (),
-        };
-        // SAFETY: `target` is the entry of a compiled GML function found in the
-        // runner table, and `thunk` has the matching signature.
-        let detour = unsafe { RawDetour::new(site.target as *const (), thunk) }
-            .map_err(|e| format!("detour {}: {e}", site.name))?;
-        site.trampoline = std::ptr::from_ref(detour.trampoline()) as usize;
-        detours.push(detour);
-    }
-    let count = sites.len();
-    for site in &sites {
-        let mods: Vec<u32> = site.chain.iter().map(|l| l.mod_id).collect();
-        log::debug!(
-            "hook site {} @ {:#x} ({:?}) mods {mods:?}",
-            site.name,
-            site.target,
-            site.kind
-        );
-    }
+    let detours = build_detours(&mut sites, |i, kind| match kind {
+        Kind::Event => EVENT_THUNKS[i] as usize,
+        Kind::Script => SCRIPT_THUNKS[i] as usize,
+        Kind::Builtin => BUILTIN_THUNKS[i] as usize,
+    });
+    let names: Vec<String> = detours
+        .iter()
+        .map(|(i, _)| sites[*i].name.clone())
+        .collect();
     // Publish before enabling: a thunk may run the instant its detour is live.
+    // A site left out keeps trampoline 0 and is never entered.
     SITES
         .set(sites.into_boxed_slice())
         .map_err(|_| "hooks installed twice".to_owned())?;
-    for d in &detours {
-        // SAFETY: game threads are not yet running GML (this runs in the entry hook).
-        unsafe { d.enable() }.map_err(|e| format!("enable detour: {e}"))?;
+    let mut count = 0;
+    for ((_, d), name) in detours.iter().zip(&names) {
+        // SAFETY: game threads are not yet running GML (this runs in the entry
+        // hook); the site with this trampoline is published above.
+        match unsafe { d.enable() } {
+            Ok(()) => count += 1,
+            Err(e) => log::warn!("hook {name} refused: enabling its detour failed ({e})"),
+        }
     }
-    // Detours must live forever; the game calls through them until exit.
-    std::mem::forget(detours);
     Ok(count)
+}
+
+/// Build each site's detour to its thunk (`thunk(index, kind)`), setting its
+/// trampoline. A site whose detour cannot be built is logged (`hook <name>
+/// refused: ...`) and left out of the result; nothing is enabled here.
+fn build_detours(sites: &mut [Site], thunk: impl Fn(usize, Kind) -> usize) -> Vec<(usize, Detour)> {
+    let mut detours = Vec::with_capacity(sites.len());
+    for (i, site) in sites.iter_mut().enumerate() {
+        let thunk = thunk(i, site.kind);
+        let mods: Vec<u32> = site.chain.iter().map(|l| l.mod_id).collect();
+        // `target` is the entry of a compiled GML function found in the runner
+        // table (or a builtin's routine), and `thunk` has the matching signature.
+        match Detour::new(site.target, thunk, Calls::Refuse) {
+            Ok(d) => {
+                log::debug!(
+                    "hook site {} @ {:#x} ({:?}) mods {mods:?}: {} bytes copied, relocated {}",
+                    site.name,
+                    site.target,
+                    site.kind,
+                    d.plan().copied,
+                    d.plan().relocated()
+                );
+                site.trampoline = d.trampoline();
+                detours.push((i, d));
+            }
+            Err(e) => log::warn!("hook {} refused: {e}", site.name),
+        }
+    }
+    detours
 }
 
 /// Advance the chain for `call`: next mod callback, or the original function.
@@ -527,13 +680,16 @@ pub fn install_guard(sites: crate::guard::Sites, using: DetourUse) -> Result<(),
     let mut detour = None;
     let events = using.events;
     if using.events || using.observers {
-        // SAFETY: `sites.execute_it` is the runner's `ExecuteIt` (found by
-        // shape: the single callee of the event executor wrapper, which calls
-        // `YYError`), and `execute_it_hook` has its signature.
-        let d =
-            unsafe { RawDetour::new(sites.execute_it as *const (), execute_it_hook as *const ()) }
-                .map_err(|e| format!("detour ExecuteIt: {e}"))?;
-        execute_it = Some(std::ptr::from_ref(d.trampoline()) as usize);
+        // `sites.execute_it` is the runner's `ExecuteIt` (found by shape: the
+        // single callee of the event executor wrapper, which calls `YYError`),
+        // and `execute_it_hook` has its signature.
+        let d = Detour::new(
+            sites.execute_it,
+            execute_it_hook as *const () as usize,
+            Calls::Refuse,
+        )
+        .map_err(|e| format!("detour ExecuteIt: {e}"))?;
+        execute_it = Some(d.trampoline());
         detour = Some(d);
     }
     GUARD
@@ -547,9 +703,9 @@ pub fn install_guard(sites: crate::guard::Sites, using: DetourUse) -> Result<(),
         STATS_ON.store(true, Ordering::Relaxed);
     }
     if let Some(d) = detour {
-        // SAFETY: game threads are not yet running GML (this runs in the entry hook).
+        // SAFETY: game threads are not yet running GML (this runs in the entry
+        // hook); the trampoline is published in `GUARD` above.
         unsafe { d.enable() }.map_err(|e| format!("enable ExecuteIt detour: {e}"))?;
-        std::mem::forget(d);
     }
     Ok(())
 }
@@ -1477,17 +1633,17 @@ mod tests {
 
     #[test]
     fn kinds() {
-        assert_eq!(Kind::of("gml_Object_oBounty_Step_0"), Some(Kind::Event));
-        assert_eq!(Kind::of("gml_Script_powerupAttract"), Some(Kind::Script));
-        assert_eq!(Kind::of("gml_GlobalScript_powerupAttract"), None);
+        assert_eq!(Kind::of("gml_Object_oWidget_Step_0"), Some(Kind::Event));
+        assert_eq!(Kind::of("gml_Script_widgetPull"), Some(Kind::Script));
+        assert_eq!(Kind::of("gml_GlobalScript_widgetPull"), None);
         assert_eq!(Kind::of("builtin:instance_copy"), Some(Kind::Builtin));
         assert_eq!(Kind::of("instance_copy"), None);
     }
 
     #[test]
     fn short_names() {
-        assert_eq!(short_name("gml_Object_oPlayer_Step_0"), "oPlayer_Step_0");
-        assert_eq!(short_name("gml_Script_powerupAttract"), "powerupAttract()");
+        assert_eq!(short_name("gml_Object_oThing_Step_0"), "oThing_Step_0");
+        assert_eq!(short_name("gml_Script_widgetPull"), "widgetPull()");
     }
 
     use crate::guard::{add_observer, freeze_observers, observers, observers_registered};
@@ -1646,5 +1802,327 @@ mod tests {
             SCRIPT_THUNKS[0] as usize,
             SCRIPT_THUNKS[MAX_SITES - 1] as usize
         );
+    }
+
+    extern "C" fn seven(_: u32) -> u32 {
+        7
+    }
+
+    type Code = extern "C" fn(u32) -> u32;
+
+    /// Write `code` into fresh code memory near this test binary.
+    fn place(code: &[u8]) -> usize {
+        let at = win::alloc_code_near(seven as *const () as usize, 64, detour::NEAR as usize)
+            .expect("code memory");
+        // SAFETY: fresh code memory nothing runs yet.
+        unsafe { win::write_code(at, code) }.expect("write");
+        at
+    }
+
+    fn run(at: usize, arg: u32) -> u32 {
+        // SAFETY: `at` holds a complete function of this signature (the
+        // tests' own machine code, or a trampoline built for one).
+        let f: Code = unsafe { std::mem::transmute(at) };
+        f(arg)
+    }
+
+    /// `cmp qword [rip+X], 0` with the immediate after the displacement, here
+    /// reading a slot of its own. Through the trampoline it reads the same
+    /// slot: the relocated displacement goes at its decoded place and the
+    /// immediate stays as it was.
+    #[test]
+    fn a_detoured_rip_compare_runs_through_its_trampoline() {
+        let mut code = vec![
+            0x48, 0x83, 0xEC, 0x28, // sub rsp, 28h
+            0x48, 0x83, 0x3D, 0x1C, 0, 0, 0, 0x00, // cmp qword [rip+1Ch] (slot at 40), 0
+            0x74, 0x0A, // je +10 (to 24)
+            0xB8, 1, 0, 0, 0, // mov eax, 1
+            0x48, 0x83, 0xC4, 0x28, // add rsp, 28h
+            0xC3, // ret
+            0xB8, 2, 0, 0, 0, // 24: mov eax, 2
+            0x48, 0x83, 0xC4, 0x28, // add rsp, 28h
+            0xC3, // ret
+        ];
+        code.resize(40, 0xCC);
+        code.extend_from_slice(&0u64.to_le_bytes()); // the slot
+        let f = place(&code);
+        assert_eq!(run(f, 0), 2);
+        let d = Detour::new(f, seven as *const () as usize, Calls::Refuse).expect("detour");
+        assert_eq!(d.plan().copied, 12);
+        assert_eq!(d.plan().relocated(), "rip+0x4");
+        // SAFETY: nothing else runs this test function.
+        unsafe { d.enable() }.expect("enable");
+        assert_eq!(run(f, 0), 7, "the patch goes to the replacement");
+        assert_eq!(run(d.trampoline(), 0), 2, "slot 0: the original's je taken");
+        // SAFETY: the slot is data in the test's own code memory.
+        unsafe { win::write_code(f + 40, &5u64.to_le_bytes()) }.expect("write slot");
+        assert_eq!(
+            run(d.trampoline(), 0),
+            1,
+            "slot 5: the original falls through"
+        );
+    }
+
+    /// `jcc rel8` in the copied bytes, its target past them: relocated to a
+    /// `jcc rel32` into the original.
+    #[test]
+    fn a_detoured_short_jcc_runs_through_its_trampoline() {
+        let code = [
+            0x85, 0xC9, // test ecx, ecx
+            0x74, 0x06, // je +6 (to 10)
+            0xB8, 1, 0, 0, 0,    // mov eax, 1
+            0xC3, // ret
+            0xB8, 2, 0, 0, 0,    // 10: mov eax, 2
+            0xC3, // ret
+        ];
+        let f = place(&code);
+        let d = Detour::new(f, seven as *const () as usize, Calls::Refuse).expect("detour");
+        assert_eq!(d.plan().copied, 9);
+        assert_eq!(d.plan().relocated(), "jcc+0x2");
+        // SAFETY: nothing else runs this test function.
+        unsafe { d.enable() }.expect("enable");
+        assert_eq!(run(f, 0), 7);
+        assert_eq!(run(d.trampoline(), 0), 2);
+        assert_eq!(run(d.trampoline(), 1), 1);
+    }
+
+    /// A function the detour cannot move is refused and left unchanged.
+    #[test]
+    fn a_refused_detour_leaves_the_function_alone() {
+        let code = [
+            0xE2, 0x02, // loop +2
+            0x31, 0xC0, // xor eax, eax
+            0xB8, 3, 0, 0, 0,    // mov eax, 3
+            0xC3, // ret
+        ];
+        let f = place(&code);
+        let e = Detour::new(f, seven as *const () as usize, Calls::Refuse).unwrap_err();
+        assert!(
+            e.to_string()
+                .starts_with("its first bytes cannot be moved (at +0x0: loop or jrcxz"),
+            "{e}"
+        );
+        assert_eq!(win::read_code(f, code.len()).unwrap(), code);
+        // Registration reports the same reason.
+        let r = detour_plan(f, Calls::Refuse).unwrap_err();
+        assert!(matches!(r, DetourError::Refused { .. }));
+    }
+
+    extern "C" fn eight(_: u32) -> u32 {
+        8
+    }
+
+    /// `test ecx, ecx; je +6; mov eax, 1; ret; mov eax, 2; ret`.
+    const JCC_FN: [u8; 16] = [
+        0x85, 0xC9, 0x74, 0x06, 0xB8, 1, 0, 0, 0, 0xC3, 0xB8, 2, 0, 0, 0, 0xC3,
+    ];
+
+    /// The CRT entry point's shape: `sub rsp, 28h; call helper; add rsp, 28h;
+    /// add eax, 1; ret`, the helper (`mov eax, 40; ret`) at +32.
+    fn entry_shape() -> Vec<u8> {
+        let mut code = vec![
+            0x48, 0x83, 0xEC, 0x28, // sub rsp, 28h
+            0xE8, 0x17, 0, 0, 0, // call +23 (to 32)
+            0x48, 0x83, 0xC4, 0x28, // add rsp, 28h
+            0x83, 0xC0, 0x01, // add eax, 1
+            0xC3, // ret
+        ];
+        code.resize(32, 0xCC);
+        code.extend_from_slice(&[0xB8, 40, 0, 0, 0, 0xC3]);
+        code
+    }
+
+    /// A function whose first bytes are already a hook's `jmp rel32` (this
+    /// loader's own patch; another injector's looks the same) is detoured
+    /// again: the second hook runs first, its trampoline reaches the first
+    /// hook, the first hook's trampoline the original.
+    #[test]
+    fn a_detoured_function_is_detoured_again() {
+        let f = place(&JCC_FN);
+        let first = Detour::new(f, seven as *const () as usize, Calls::Refuse).expect("first");
+        // SAFETY: nothing else runs this test function.
+        unsafe { first.enable() }.expect("enable");
+        let second = Detour::new(f, eight as *const () as usize, Calls::Refuse).expect("second");
+        assert_eq!(second.plan().copied, 5);
+        assert_eq!(second.plan().relocated(), "jmp+0x0");
+        // SAFETY: as above.
+        unsafe { second.enable() }.expect("enable");
+        assert_eq!(run(f, 0), 8);
+        assert_eq!(run(second.trampoline(), 0), 7);
+        assert_eq!(run(first.trampoline(), 0), 2);
+        assert_eq!(run(first.trampoline(), 1), 1);
+    }
+
+    /// The entry point's call, relocated (`Calls::Relocate`) and run.
+    #[test]
+    fn a_relocated_call_runs_through_its_trampoline() {
+        let f = place(&entry_shape());
+        assert_eq!(run(f, 0), 41);
+        assert!(Detour::new(f, seven as *const () as usize, Calls::Refuse).is_err());
+        let d = Detour::new(f, seven as *const () as usize, Calls::Relocate).expect("detour");
+        assert_eq!(d.plan().copied, 9);
+        // SAFETY: nothing else runs this test function.
+        unsafe { d.enable() }.expect("enable");
+        assert_eq!(run(f, 0), 7);
+        assert_eq!(run(d.trampoline(), 0), 41);
+    }
+
+    /// An entry point that starts `call $+5; pop` (a wrapper finding its own
+    /// address) is refused even with calls allowed: the entry hook then
+    /// takes its "running unmodded" path. The function is left as it was.
+    #[test]
+    fn a_call_to_the_next_instruction_is_refused_at_the_entry_point() {
+        let code = [
+            0xE8, 0, 0, 0, 0,    // call $+5
+            0x58, // pop rax
+            0x31, 0xC0, // xor eax, eax
+            0xC3, // ret
+        ];
+        let f = place(&code);
+        let e = Detour::new(f, seven as *const () as usize, Calls::Relocate).unwrap_err();
+        assert!(
+            e.to_string().starts_with(
+                "its first bytes cannot be moved (at +0x0: a call to the copied bytes"
+            ),
+            "{e}"
+        );
+        assert_eq!(win::read_code(f, code.len()).unwrap(), code);
+    }
+
+    /// `jmp rel8` over padding, `jmp rel32` (a tail call) and a 3-byte
+    /// function over padding: each run through its trampoline.
+    #[test]
+    fn short_functions_run_through_their_trampolines() {
+        // jmp +3; int3 x3; mov eax, 9; ret
+        let f = place(&[0xEB, 0x03, 0xCC, 0xCC, 0xCC, 0xB8, 9, 0, 0, 0, 0xC3]);
+        let d = Detour::new(f, seven as *const () as usize, Calls::Refuse).expect("jmp rel8");
+        assert_eq!(d.plan().copied, 2);
+        // SAFETY: nothing else runs this test function.
+        unsafe { d.enable() }.expect("enable");
+        assert_eq!(run(f, 0), 7);
+        assert_eq!(run(d.trampoline(), 0), 9);
+        // jmp +11 (to 16); padding; 16: mov eax, 11; ret
+        let mut code = vec![0xE9, 0x0B, 0, 0, 0];
+        code.resize(16, 0xCC);
+        code.extend_from_slice(&[0xB8, 11, 0, 0, 0, 0xC3]);
+        let f = place(&code);
+        let d = Detour::new(f, seven as *const () as usize, Calls::Refuse).expect("jmp rel32");
+        // SAFETY: as above.
+        unsafe { d.enable() }.expect("enable");
+        assert_eq!(run(f, 0), 7);
+        assert_eq!(run(d.trampoline(), 0), 11);
+        // xor eax, eax; ret; int3 x5 (3 bytes of function, the rest padding)
+        let f = place(&[0x31, 0xC0, 0xC3, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC]);
+        let d = Detour::new(f, seven as *const () as usize, Calls::Refuse).expect("short ret");
+        assert_eq!(d.plan().copied, 3);
+        // SAFETY: as above.
+        unsafe { d.enable() }.expect("enable");
+        assert_eq!(run(f, 5), 7);
+        assert_eq!(run(d.trampoline(), 5), 0);
+    }
+
+    /// The forms `emit` writes when the trampoline is out of `rel32` reach of
+    /// what the copied bytes address (an inverted `jcc` over `jmp [rip+0]`,
+    /// the absolute jump back, `call [rip+2]; jmp +8`): built far from the
+    /// function and run there.
+    #[test]
+    fn far_trampolines_run() {
+        for (code, calls, expect) in [
+            (JCC_FN.to_vec(), Calls::Refuse, [2, 1]),
+            (entry_shape(), Calls::Relocate, [41, 41]),
+        ] {
+            let f = place(&code);
+            let bytes = win::read_code(f, detour::READ_LEN).expect("read");
+            let plan = detour::plan(&bytes, f as u64, calls).expect("plan");
+            // Some far address with free memory near it (a fixed one can
+            // fall inside a large reservation of the process).
+            let far = [6usize, 12, 24, 48, 96, 200, 1000]
+                .into_iter()
+                .flat_map(|g| [f.checked_sub(g << 30), f.checked_add(g << 30)])
+                .flatten()
+                .find_map(|t| win::alloc_code_near(t, 128, detour::NEAR as usize))
+                .expect("far code memory");
+            assert!(far.abs_diff(f) > 1 << 32);
+            let t = detour::emit(&plan, &bytes, f as u64, far as u64).expect("emit");
+            assert!(t.len() <= detour::TRAMPOLINE_MAX);
+            // SAFETY: fresh code memory nothing runs yet.
+            unsafe { win::write_code(far, &t) }.expect("write");
+            assert_eq!(run(far, 0), expect[0]);
+            assert_eq!(run(far, 1), expect[1]);
+        }
+    }
+
+    /// The documented limitation (Limitations in `docs/how-it-works.md`):
+    /// a branch from later in the function back into its first bytes is not
+    /// looked for. `xor eax, eax; L: add eax, ecx; dec ecx; jnz L; ret` sums
+    /// 1..=n with `L` at +2, inside the patch: the planner accepts it (not
+    /// run through a detour: the jump back would execute the patch's
+    /// displacement as code).
+    #[test]
+    fn a_loop_back_into_the_patch_is_accepted_as_documented() {
+        let code = [
+            0x31, 0xC0, // xor eax, eax
+            0x01, 0xC8, // 2: add eax, ecx
+            0xFF, 0xC9, // dec ecx
+            0x75, 0xFA, // jnz 2
+            0xC3, // ret
+        ];
+        let f = place(&code);
+        assert_eq!(run(f, 4), 10);
+        let bytes = win::read_code(f, detour::READ_LEN).expect("read");
+        let plan = detour::plan(&bytes, f as u64, Calls::Refuse).expect("accepted");
+        assert_eq!(plan.copied, 6);
+    }
+
+    fn site(name: &str, target: usize) -> Site {
+        Site {
+            name: name.to_owned(),
+            kind: Kind::Script,
+            target,
+            chain: vec![link(1)],
+            trampoline: 0,
+        }
+    }
+
+    /// `install`'s per-site step: a site whose detour cannot be built (here
+    /// one at an address that is not code) is left out, the others are
+    /// built and get their trampolines.
+    #[test]
+    fn a_site_that_cannot_be_detoured_is_left_out_and_the_others_built() {
+        static NOT_CODE: [u8; 64] = [0x90; 64];
+        let good = place(&JCC_FN);
+        let refused = place(&[0xE2, 0x02, 0x31, 0xC0, 0xB8, 3, 0, 0, 0, 0xC3]);
+        let mut sites = vec![
+            site("gml_Script_good", good),
+            site("gml_Script_data", NOT_CODE.as_ptr() as usize),
+            site("gml_Script_loop", refused),
+        ];
+        let built = build_detours(&mut sites, |_, _| seven as *const () as usize);
+        assert_eq!(built.iter().map(|(i, _)| *i).collect::<Vec<_>>(), [0]);
+        assert_eq!(sites[0].trampoline, built[0].1.trampoline());
+        assert_eq!((sites[1].trampoline, sites[2].trampoline), (0, 0));
+        // Nothing enabled: the good function still runs as it is.
+        assert_eq!(run(good, 0), 2);
+    }
+
+    /// A write that cannot be made fails before any byte is written.
+    #[test]
+    fn a_failed_code_write_is_reported() {
+        // SAFETY: an address in the never-mapped first page: VirtualProtect
+        // fails and the copy is never reached.
+        let e = unsafe { win::write_code(0x10, &[0x90]) }.unwrap_err();
+        assert!(e.starts_with("VirtualProtect failed"), "{e}");
+    }
+
+    /// Registration refuses a function the detour cannot move, with the
+    /// status the mod gets and the reason for the log.
+    #[test]
+    fn registration_refuses_an_unmovable_function() {
+        let f = place(&[0xE2, 0x02, 0x31, 0xC0, 0xB8, 3, 0, 0, 0, 0xC3]);
+        let mut index = crate::yyc::RunnerIndex::default();
+        index.functions.insert("gml_Script_loops".to_owned(), f);
+        let r = register(&index, 1, "gml_Script_loops", noop, core::ptr::null_mut()).unwrap_err();
+        assert_eq!(r.status, Status::Unsupported);
+        assert!(r.why.unwrap().contains("loop or jrcxz"));
     }
 }

@@ -30,12 +30,13 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use ndml_sdk::abi::{MOD_ABI_SYMBOL, MOD_ENTRY_SYMBOL, ModAbiFn, ModEntryFn, ModInit};
-use windows_sys::Win32::Foundation::MAX_PATH;
+use windows_sys::Win32::Foundation::{MAX_PATH, SYSTEMTIME};
 use windows_sys::Win32::System::Console::AllocConsole;
 use windows_sys::Win32::System::Diagnostics::Debug::OutputDebugStringA;
 use windows_sys::Win32::System::LibraryLoader::{
     GetModuleFileNameW, GetModuleHandleW, GetProcAddress, LoadLibraryW,
 };
+use windows_sys::Win32::System::SystemInformation::GetLocalTime;
 
 use crate::pe;
 
@@ -46,6 +47,33 @@ pub fn debug_out(msg: &str) {
     bytes.push(0);
     // SAFETY: NUL-terminated buffer that outlives the call.
     unsafe { OutputDebugStringA(bytes.as_ptr()) };
+}
+
+/// The PC's local date and time now (`GetLocalTime`), as plain fields.
+#[derive(Debug, Clone, Copy)]
+pub struct LocalTime {
+    pub year: u16,
+    pub month: u16,
+    pub day: u16,
+    pub hour: u16,
+    pub minute: u16,
+    pub second: u16,
+}
+
+/// The PC's local date and time now (the kept logs' names).
+pub fn local_time() -> LocalTime {
+    let mut t = SYSTEMTIME::default();
+    // SAFETY: `t` is a valid, writable SYSTEMTIME for the whole call;
+    // GetLocalTime only fills it and cannot fail.
+    unsafe { GetLocalTime(&raw mut t) };
+    LocalTime {
+        year: t.wYear,
+        month: t.wMonth,
+        day: t.wDay,
+        hour: t.wHour,
+        minute: t.wMinute,
+        second: t.wSecond,
+    }
 }
 
 /// Full path of the host executable.
@@ -234,6 +262,177 @@ pub fn read_memory(addr: usize, len: usize) -> Option<Vec<u8>> {
     // committed, readable region; `out` has `len` bytes.
     unsafe { core::ptr::copy_nonoverlapping(addr as *const u8, out.as_mut_ptr(), len) };
     Some(out)
+}
+
+// ---- Code memory for inline detours (`crate::hooks::Detour`) ----
+
+/// `VirtualQuery` of `addr`, or `None` past the address space.
+fn query(addr: usize) -> Option<windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION> {
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+    // SAFETY: MEMORY_BASIC_INFORMATION is plain data; all-zero is valid.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { core::mem::zeroed() };
+    // SAFETY: VirtualQuery only inspects the address space; buffer and size match.
+    let n = unsafe {
+        VirtualQuery(
+            addr as *const core::ffi::c_void,
+            &raw mut info,
+            size_of::<MEMORY_BASIC_INFORMATION>(),
+        )
+    };
+    (n != 0).then_some(info)
+}
+
+/// Up to `max` bytes of code at `addr`, from its memory region only (fewer
+/// at the region's end). `None` unless the region is committed and
+/// executable.
+pub fn read_code(addr: usize, max: usize) -> Option<Vec<u8>> {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
+        PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_NOACCESS,
+    };
+    let info = query(addr)?;
+    let readable_code = PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    if info.State != MEM_COMMIT
+        || info.Protect & (PAGE_GUARD | PAGE_NOACCESS | PAGE_EXECUTE) != 0
+        || info.Protect & readable_code == 0
+    {
+        return None;
+    }
+    let end = (info.BaseAddress as usize).checked_add(info.RegionSize)?;
+    let len = max.min(end.checked_sub(addr)?);
+    let mut out = vec![0u8; len];
+    // SAFETY: [addr, addr+len) lies in one committed, readable region; `out`
+    // has `len` bytes.
+    unsafe { core::ptr::copy_nonoverlapping(addr as *const u8, out.as_mut_ptr(), len) };
+    Some(out)
+}
+
+/// One allocation of code memory: relays and trampolines, never freed.
+const CODE_BLOCK: usize = 0x1_0000;
+/// Windows' allocation granularity on x64 (where `VirtualAlloc` can place a
+/// block).
+const ALLOC_GRANULARITY: usize = 0x1_0000;
+
+#[derive(Debug)]
+struct CodeBlock {
+    base: usize,
+    used: usize,
+}
+
+static CODE_BLOCKS: std::sync::Mutex<Vec<CodeBlock>> = std::sync::Mutex::new(Vec::new());
+/// Held by [`write_code`] from protect to flush: one code writer at a time.
+static CODE_WRITER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// `len` bytes (16-byte aligned) of executable memory lying wholly within
+/// `near` bytes of `target`, kept for the process lifetime. Read and execute
+/// only: written through [`write_code`]. `None` if no free address range is
+/// within reach.
+pub fn alloc_code_near(target: usize, len: usize, near: usize) -> Option<usize> {
+    let len = len.next_multiple_of(16);
+    if len > CODE_BLOCK {
+        return None;
+    }
+    let within = |a: usize| a.abs_diff(target) <= near && (a + len).abs_diff(target) <= near;
+    let mut blocks = CODE_BLOCKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(b) = blocks
+        .iter_mut()
+        .find(|b| b.used + len <= CODE_BLOCK && within(b.base + b.used))
+    {
+        let at = b.base + b.used;
+        b.used += len;
+        return Some(at);
+    }
+    let base = reserve_near(target, near)?;
+    blocks.push(CodeBlock { base, used: len });
+    Some(base)
+}
+
+/// Commit a [`CODE_BLOCK`] in a free range within `near` of `target`: the
+/// nearest free range above it first, then below.
+fn reserve_near(target: usize, near: usize) -> Option<usize> {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_FREE, MEM_RESERVE, PAGE_EXECUTE_READ, VirtualAlloc,
+    };
+    let try_at = |a: usize| -> Option<usize> {
+        // SAFETY: asks for fresh pages at a free address; no existing memory
+        // is touched (the call fails if the range is taken).
+        let p = unsafe {
+            VirtualAlloc(
+                a as *const core::ffi::c_void,
+                CODE_BLOCK,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_EXECUTE_READ,
+            )
+        };
+        (!p.is_null()).then_some(p as usize)
+    };
+    let lo = target.saturating_sub(near).max(ALLOC_GRANULARITY);
+    let hi = target.saturating_add(near);
+    let mut at = target.next_multiple_of(ALLOC_GRANULARITY);
+    while at.checked_add(CODE_BLOCK)? <= hi {
+        let Some(info) = query(at) else { break };
+        let end = (info.BaseAddress as usize).checked_add(info.RegionSize)?;
+        if info.State == MEM_FREE
+            && at + CODE_BLOCK <= end
+            && let Some(p) = try_at(at)
+        {
+            return Some(p);
+        }
+        at = end.next_multiple_of(ALLOC_GRANULARITY);
+    }
+    let mut at = (target / ALLOC_GRANULARITY * ALLOC_GRANULARITY).checked_sub(CODE_BLOCK)?;
+    while at >= lo {
+        let Some(info) = query(at) else { break };
+        let base = info.BaseAddress as usize;
+        let end = base.checked_add(info.RegionSize)?;
+        if info.State == MEM_FREE
+            && at + CODE_BLOCK <= end
+            && let Some(p) = try_at(at)
+        {
+            return Some(p);
+        }
+        at = (base / ALLOC_GRANULARITY * ALLOC_GRANULARITY).checked_sub(CODE_BLOCK)?;
+    }
+    None
+}
+
+/// Write `bytes` over code at `addr`: the range made writable for the copy,
+/// its protection put back, the instruction cache flushed. Writers are
+/// serialised (one at a time in the process, [`CODE_WRITER`]), so two threads
+/// writing code on the same page cannot undo each other's protection change.
+///
+/// # Safety
+/// `addr..addr + bytes.len()` must be committed code that no thread executes
+/// while it is written (memory from [`alloc_code_near`] nothing jumps to
+/// yet, or a function no game thread runs yet), and the result must be valid
+/// code.
+pub unsafe fn write_code(addr: usize, bytes: &[u8]) -> Result<(), String> {
+    use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
+    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let ptr = addr as *mut core::ffi::c_void;
+    let mut old = 0;
+    let _one_writer = CODE_WRITER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // SAFETY: changes only the protection of committed pages (caller).
+    if unsafe { VirtualProtect(ptr, bytes.len(), PAGE_EXECUTE_READWRITE, &raw mut old) } == 0 {
+        return Err(format!(
+            "VirtualProtect failed ({})",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: the range was just made writable; nothing executes it during
+    // the copy (caller); `bytes` does not overlap code memory.
+    unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.cast::<u8>(), bytes.len()) };
+    let mut was = 0;
+    // SAFETY: puts back the protection read above on the same range.
+    unsafe { VirtualProtect(ptr, bytes.len(), old, &raw mut was) };
+    // SAFETY: flushes this process's instruction cache for the range.
+    unsafe { FlushInstructionCache(GetCurrentProcess(), ptr, bytes.len()) };
+    Ok(())
 }
 
 /// Whether key `vk` (virtual-key code) is held down while one of this

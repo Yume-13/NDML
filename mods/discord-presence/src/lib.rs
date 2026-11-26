@@ -532,7 +532,7 @@ mod tests {
         assert_eq!(a.details.as_deref(), Some("Wave 40 · Level 18"));
         assert_eq!(a.state.as_deref(), Some("vs Dreadnought · Score 2,500,000"));
         assert!(
-            !presence::activity_json(&a, Some(1_795_000_000)).contains("assets"),
+            !presence::activity_json(&a, Some(1_750_000_000)).contains("assets"),
             "no picture"
         );
 
@@ -566,8 +566,8 @@ mod tests {
         assert_eq!(b.state.as_deref(), Some("Engineer · Run 12:34"));
         // Both lines carry the same session start: the rotation does not
         // restart the time Discord shows.
-        let start = Some(1_795_000_000);
-        let ts = r#""timestamps":{"start":1795000000}"#;
+        let start = Some(1_750_000_000);
+        let ts = r#""timestamps":{"start":1750000000}"#;
         assert!(presence::activity_json(&a, start).contains(ts));
         assert!(presence::activity_json(&b, start).contains(ts));
     }

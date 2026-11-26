@@ -408,12 +408,12 @@ mod tests {
         assert_eq!(a.state.as_deref(), Some("Score 1,234,567"));
         assert_eq!(
             activity_json(&a, Some(START)),
-            r#"{"details":"Wave 23 · Level 12","state":"Score 1,234,567","timestamps":{"start":1795000000}}"#
+            r#"{"details":"Wave 23 · Level 12","state":"Score 1,234,567","timestamps":{"start":1750000000}}"#
         );
     }
 
     /// A session start in Unix seconds.
-    const START: u64 = 1_795_000_000;
+    const START: u64 = 1_750_000_000;
 
     /// Menu, run and boss fight all carry the same session start, so the
     /// time Discord shows keeps counting through status changes.
@@ -435,7 +435,7 @@ mod tests {
             .map(|a| activity_json(a.as_ref().unwrap(), Some(START)))
             .collect();
         for j in &jsons {
-            assert!(j.ends_with(r#","timestamps":{"start":1795000000}}"#), "{j}");
+            assert!(j.ends_with(r#","timestamps":{"start":1750000000}}"#), "{j}");
         }
         assert!(jsons[2].contains("vs Star Eater"), "{}", jsons[2]);
     }

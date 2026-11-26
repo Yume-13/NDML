@@ -33,11 +33,14 @@
 //!     ndml.toml            <- Settings
 //!     mods/ndmod_*.dll     <- mods, loaded alphabetically
 //!     config/<mod>.toml    <- per-mod config (written by mods / the manager)
-//!     logs/ndml.log        <- truncated each launch
+//!     logs/ndml.log        <- this launch's log; the last nine launches'
+//!                             beside it as ndml-<start, local>.log (log_keep)
 //! ```
 //! All state is local to the game folder; nothing is written to `AppData`.
 
 #![forbid(unsafe_code)]
+
+pub mod log_keep;
 
 use std::path::{Path, PathBuf};
 

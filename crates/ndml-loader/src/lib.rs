@@ -32,7 +32,9 @@
 //!    → enable hook detours → jump to the real entry point.
 //!
 //! Any failure is logged and the game starts unmodded; a loader error never
-//! prevents the game from launching.
+//! prevents the game from launching. A failure before the log is opened (the
+//! entry detour, the `ndml/` folder) goes only to the debugger output
+//! (`OutputDebugString`), and `ndml.log` stays the previous session's.
 //!
 //! ## Unsafe code policy
 //! Denied crate-wide. Exactly five modules opt out, each because it *is* an FFI
@@ -42,6 +44,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod detour;
 mod entry;
 pub mod guard;
 pub mod hooks;
@@ -67,12 +70,15 @@ fn bootstrap() {
         return;
     }
     let (settings, settings_problems) = ndml_common::load(&paths.settings_file());
-    logging::init(&paths.log_file(), settings.level_filter(), settings.console);
+    let log_problems = logging::init(&paths.logs, settings.level_filter(), settings.console);
     log::info!(
         "NDML {} starting in {}",
         env!("CARGO_PKG_VERSION"),
         game_dir.display()
     );
+    if !log_problems.is_empty() {
+        log::warn!("keeping the last logs: {}", log_problems.join("; "));
+    }
     // The whole file unreadable ("unable to read ndml.toml (...); using
     // defaults"), or one line per key skipped or left at its default.
     for p in settings_problems {

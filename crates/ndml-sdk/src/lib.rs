@@ -45,7 +45,8 @@
 //!
 //! Unsafe code is confined to the private `ffi` module; everything else here
 //! (and in every mod) is safe Rust. Mods log through the `log` crate; output
-//! lands in `ndml/logs/ndml.log`. See `docs/mod-api.md`.
+//! lands in `ndml/logs/ndml.log` (this launch's; the last nine launches' are
+//! kept beside it, named by their start). See `docs/mod-api.md`.
 
 #![deny(unsafe_code)] // only `ffi` opts out, with a module-level allow
 
@@ -300,7 +301,8 @@ impl ModContext {
     /// [`Call::result`]/[`Call::set_return`] read and replace the result.
     /// `Err(Hook { status: NotReady })` if the loader found no builtin
     /// registrations, `NotFound` for an unknown name, `Unsupported` from a
-    /// loader without builtin hooks.
+    /// loader without builtin hooks or for a builtin whose first bytes the
+    /// loader's detour cannot move (the loader logs why).
     #[track_caller]
     pub fn hook_builtin<S, B, A>(&self, name: &str, before: B, after: A) -> Result<(), Error>
     where

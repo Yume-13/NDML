@@ -1260,6 +1260,8 @@ mod tests {
         ((to as isize - from_end as isize) as i32).to_le_bytes()
     }
 
+    /// The shape the matcher looks for: `mov eax, [rip+c]; sub eax, ecx;
+    /// mov ecx, 0; cmovs eax, ecx; mov [rip+c], eax; ret`.
     #[test]
     fn gc_pop_shape() {
         let data = Section {

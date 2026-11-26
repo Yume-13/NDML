@@ -36,8 +36,11 @@ and function pointers.
    6. continue to the game's real entry point.
 
 If any step fails, the failure is logged and the game starts without that feature, or
-unmodded. NDML never stops the game from launching. A mod whose init fails keeps none of
-the hooks or observers it registered; the other mods load as usual.
+unmodded. NDML never stops the game from launching. A failure before the log is opened
+(the entry-point detour, or creating the `ndml/` folder) is reported only to the debugger
+output (`OutputDebugString`); `ndml.log` is then still the previous session's (its first
+line gives the start time). A mod whose init fails keeps none of the hooks or observers
+it registered; the other mods load as usual.
 
 ## Finding functions and variables
 
@@ -80,6 +83,16 @@ in mod load order, the first registered outermost. The last link calls the origi
 function through the detour's trampoline, at most once. A callback can run code before
 and after the original, read and change arguments and variables, replace the return
 value, or skip the original together with the rest of the chain.
+
+A detour overwrites the function's first 5 bytes with a `jmp` to a small relay placed
+within reach of the function, and copies the whole instructions in those bytes to a
+trampoline beside the relay, followed by a jump back.
+Copied instructions that depend on their address (`[rip+disp32]` operands, relative
+jumps and conditional branches) are rewritten to reach the same targets. Anything the
+detour cannot move safely (a call, a loop instruction, a branch into the copied bytes,
+an instruction it does not know) is refused: registering the hook fails with
+`Status::Unsupported`, the log says why (`hook <name> refused: Unsupported (...)`), and
+the function runs unhooked.
 
 Hookable: object events `gml_Object_*`, scripts `gml_Script_*`, and built-in functions
 named `builtin:<name>`. The `gml_GlobalScript_*` wrappers are not hookable.
@@ -148,11 +161,18 @@ mod asks for them during init, and both run on one detour on the runtime's `Exec
 
 ## Logging
 
-The loader and every mod log to `ndml/logs/ndml.log`, rewritten at each launch, one line
-per message: `[seconds] LEVEL target: message`, where `target` is the loader module
-(`ndml_loader`, `ndml_loader::mods`, …) or the mod's DLL name. `log_level` filters it;
-`console = true` also opens a console window showing the same lines. The manager's LOG
-tab shows the end of this file.
+The loader and every mod log to `ndml/logs/ndml.log`, one line per message:
+`[seconds] LEVEL target: message`, where `target` is the loader module (`ndml_loader`,
+`ndml_loader::mods`, …) or the mod's DLL name. `log_level` filters it; `console = true`
+also opens a console window showing the same lines. The manager's LOG tab shows the end
+of this file.
+
+The first line gives the session's start in local time and UTC. At the next launch,
+before the new log is opened, the previous one is renamed after that start,
+`ndml-YYYY-MM-DD_HH-MM-SS.log` in local time (with a `Z` and in UTC when the local time
+can't be read), and the oldest renamed logs are deleted so that nine remain beside the
+running one. Nothing else in the folder is renamed or deleted; a file that can't be is
+skipped and mentioned in the new log.
 
 ## Robustness and safety
 
@@ -171,6 +191,12 @@ tab shows the end of this file.
 ## Limitations
 
 * Hooks can only be added during mod init, at most 512 hooked functions in all.
+* A function whose first bytes the detour cannot move can't be hooked (see *Hooks*). In
+  Nova Drift 1.2.38.4 this applies to 20 built-in functions that start with a call,
+  among them `room_goto`, `draw_set_font` and `part_system_update`.
+* A branch later in a hooked function back into its first 5 bytes is not detected: a
+  loop back to the start would run the hook again on each pass, one back into the
+  patched bytes would run them as code.
 * Arrays, structs and methods can't be built by a mod; they can be held and passed back
   to built-in functions (`array_get`, `variable_struct_get`, …) within one hook call.
 * Asynchronous GameMaker events (such as Steam callbacks) can't be received by mods.

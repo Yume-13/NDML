@@ -209,7 +209,7 @@ mod tests {
     #[test]
     fn reads_tasklist_output() {
         assert!(tasklist_lists_game(
-            "\"NovaDrift.exe\",\"52320\",\"Console\",\"1\",\"1,190,044 K\"
+            "\"NovaDrift.exe\",\"4242\",\"Console\",\"1\",\"123,456 K\"
 "
         ));
         assert!(!tasklist_lists_game(

@@ -33,11 +33,12 @@ use core::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use retour::RawDetour;
 use windows_sys::Win32::Foundation::HMODULE;
 use windows_sys::Win32::System::LibraryLoader::DisableThreadLibraryCalls;
 use windows_sys::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
 
+use crate::detour::Calls;
+use crate::hooks::Detour;
 use crate::win;
 
 /// Searched for by `ndml` (the manager) to recognise the NDML `version.dll`.
@@ -63,20 +64,25 @@ extern "system" fn DllMain(module: HMODULE, reason: u32, _reserved: *mut c_void)
     1
 }
 
+/// Detour the EXE's entry point to run [`crate::bootstrap`] first.
+///
+/// Runs under the loader lock and does no file I/O. A failure (a refused
+/// entry included) is reported only through `OutputDebugString`; the game
+/// then runs unmodded.
 fn install_entry_hook() -> Result<(), String> {
     let image = win::main_image().ok_or("cannot read EXE headers")?;
     let entry = image.base + image.layout.entry_rva;
-    // SAFETY: `entry` is the EXE's entry point, which has not run yet; the
-    // detour has the same signature.
-    let detour = unsafe { RawDetour::new(entry as *const (), entry_detour as *const ()) }
+    // `entry` is the EXE's entry point, which has not run yet; the detour has
+    // the same signature. Its first bytes call the CRT's security-cookie
+    // set-up (`sub rsp, 28h; call ...`), so the copied call is relocated:
+    // nothing unwinds through that call.
+    let detour = Detour::new(entry, entry_detour as *const () as usize, Calls::Relocate)
         .map_err(|e| e.to_string())?;
-    ENTRY_TRAMPOLINE.store(
-        std::ptr::from_ref(detour.trampoline()) as usize,
-        Ordering::Release,
-    );
-    // SAFETY: process attach is single-threaded with respect to the EXE's code.
-    unsafe { detour.enable() }.map_err(|e| e.to_string())?;
-    std::mem::forget(detour); // the trampoline must stay valid forever
+    ENTRY_TRAMPOLINE.store(detour.trampoline(), Ordering::Release);
+    // SAFETY: process attach is single-threaded with respect to the EXE's
+    // code; the trampoline is published above. The detour's memory is never
+    // freed (the trampoline stays valid for the process).
+    unsafe { detour.enable() }?;
     Ok(())
 }
 

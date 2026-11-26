@@ -16,7 +16,6 @@ crate-type = ["cdylib", "rlib"]
 ndml-sdk.workspace = true
 ndml-common.workspace = true
 log.workspace = true
-retour.workspace = true
 seq-macro.workspace = true
 
 [dependencies.windows-sys]

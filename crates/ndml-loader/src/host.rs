@@ -144,16 +144,21 @@ unsafe extern "C" fn hook_gml(
 ) -> i32 {
     // SAFETY: SDK passes a valid UTF-8 StrRef.
     let name = unsafe { name.as_str() };
-    let status = match index() {
+    let result = match index() {
         Some(index) => crate::hooks::register(index, mod_id, name, cb, user),
-        None => Status::Internal,
+        None => Err(Status::Internal.into()),
     };
-    if status == Status::Ok {
-        log::debug!(target: mod_name(mod_id), "hooked {name}");
-    } else {
-        log::warn!(target: mod_name(mod_id), "hook {name} refused: {status:?}");
+    match result {
+        Ok(()) => {
+            log::debug!(target: mod_name(mod_id), "hooked {name}");
+            Status::Ok as i32
+        }
+        Err(r) => {
+            let why = r.why.map_or_else(String::new, |w| format!(" ({w})"));
+            log::warn!(target: mod_name(mod_id), "hook {name} refused: {:?}{why}", r.status);
+            r.status as i32
+        }
     }
-    status as i32
 }
 
 /// `YYObjectBase` vtable slots used by compiled GML for instance variables:
@@ -1160,4 +1165,38 @@ unsafe extern "C-unwind" fn with_instances(
 /// frame doesn't pay for it. Logs the outcome.
 pub fn find_with_routines() {
     let _ = with_fns();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    unsafe extern "C-unwind" fn noop(_: *mut ndml_sdk::abi::HookCall, _: *mut c_void) {}
+
+    /// A hook on a function the detour cannot move reaches the mod as
+    /// `Unsupported` (and the loader logs `hook <name> refused: Unsupported
+    /// (<why>)`): the code here starts with `loop`.
+    #[test]
+    fn an_unmovable_function_reaches_the_mod_as_unsupported() {
+        let code = [0xE2, 0x02, 0x31, 0xC0, 0xB8, 3, 0, 0, 0, 0xC3];
+        let at = crate::win::alloc_code_near(noop as *const () as usize, 64, 1 << 30)
+            .expect("code memory");
+        // SAFETY: fresh code memory nothing runs.
+        unsafe { crate::win::write_code(at, &code) }.expect("write");
+        let mut index = RunnerIndex::default();
+        index.functions.insert("gml_Script_loops".to_owned(), at);
+        set_index(index);
+        let name = "gml_Script_loops";
+        // SAFETY: a valid UTF-8 name alive for the call; the callback is
+        // never called (the hook is refused).
+        let status = unsafe {
+            hook_gml(
+                0,
+                ndml_sdk::abi::StrRef::new(name),
+                noop,
+                core::ptr::null_mut(),
+            )
+        };
+        assert_eq!(status, Status::Unsupported as i32);
+    }
 }
